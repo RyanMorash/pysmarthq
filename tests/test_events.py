@@ -11,7 +11,7 @@ from aiohttp import WSMsgType
 from pysmarthq import EventStream, SmartHQApiError, SmartHQAuth, SmartHQError, SmartHQStreamClosed
 from pysmarthq.events import AlertEvent, ConnectionEvent, PresenceEvent, PubsubAckEvent, ServiceEvent
 
-from .conftest import MockSession, Response
+from tests.mock_http import MockSession, Response
 
 
 class FakeSocket:

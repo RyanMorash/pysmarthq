@@ -7,7 +7,7 @@ import pytest
 from pysmarthq import SmartHQApi, SmartHQApiError, SmartHQAuth
 from pysmarthq.models import Device
 
-from .conftest import MockSession, Response, json_body
+from tests.mock_http import MockSession, Response, json_body
 
 
 def _auth(session: MockSession) -> SmartHQAuth:

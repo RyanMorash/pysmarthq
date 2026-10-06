@@ -20,7 +20,7 @@ from pysmarthq import (
 )
 from pysmarthq.auth import AbstractAuth
 
-from .conftest import MockSession, Response, form_body
+from tests.mock_http import MockSession, Response, form_body
 
 
 def test_authorization_url_matches_the_spec() -> None:
