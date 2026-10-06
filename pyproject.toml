@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pysmarthq"
+version = "0.1.0"
+description = "Async Python client for the GE Appliances SmartHQ Identity, Digital Twin, and Event Stream APIs."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Ryan Morash" }]
+keywords = ["smarthq", "ge-appliances", "home-assistant"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = ["aiohttp>=3.9"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.urls]
+Homepage = "https://github.com/ryanmorash/pysmarthq"
+Documentation = "https://docs.smarthq.com"
+Issues = "https://github.com/ryanmorash/pysmarthq/issues"
+Source = "https://github.com/ryanmorash/pysmarthq"
+
+[tool.setuptools.packages.find]
+include = ["pysmarthq*"]
+
+[tool.setuptools.package-data]
+pysmarthq = ["py.typed"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
