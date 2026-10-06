@@ -11,7 +11,13 @@ dict through ``token_updater``.
 
 ``expires_at`` is not a field on the token response. When ``expires_in`` is an
 integer, the exchange and refresh helpers set ``expires_at`` to the local Unix
-time at which that ``expires_in`` elapses so a later call can refresh.
+time at which that ``expires_in`` elapses so a later call can refresh. The
+access token is treated as stale when ``expires_at`` is missing and when fewer
+than ``ACCESS_TOKEN_REFRESH_LEEWAY_SECONDS`` remain.
+
+``token_updater`` runs inside the refresh lock. It must not call back into the
+client. If it raises, the new token stays in memory and the next
+``async_get_access_token`` retries the updater without another token request.
 """
 
 from __future__ import annotations
@@ -24,9 +30,9 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse
 
-from aiohttp import ClientResponse, ClientSession
+from aiohttp import ClientResponse, ClientSession, ClientTimeout
 
-from .const import DIGITAL_TWIN_HOST, IAM_HOST
+from .const import ACCESS_TOKEN_REFRESH_LEEWAY_SECONDS, DIGITAL_TWIN_HOST, IAM_HOST, REQUEST_TIMEOUT_SECONDS
 from .errors import SmartHQAuthError
 
 TokenUpdater = Callable[[dict[str, Any]], Awaitable[None] | None]
@@ -122,6 +128,7 @@ async def async_exchange_code(
     code: str,
     redirect_uri: str,
     host: str = IAM_HOST,
+    timeout: ClientTimeout | None = None,
 ) -> dict[str, Any]:
     """Exchange an authorization code at ``POST /oauth2/token``.
 
@@ -137,6 +144,7 @@ async def async_exchange_code(
             "redirect_uri": redirect_uri,
         },
         host=host,
+        timeout=timeout,
     )
 
 
@@ -147,6 +155,7 @@ async def async_refresh_token(
     client_secret: str,
     refresh_token: str,
     host: str = IAM_HOST,
+    timeout: ClientTimeout | None = None,
 ) -> dict[str, Any]:
     """Exchange a refresh token at ``POST /oauth2/token``.
 
@@ -162,6 +171,7 @@ async def async_refresh_token(
             "refresh_token": refresh_token,
         },
         host=host,
+        timeout=timeout,
     )
 
 
@@ -172,14 +182,29 @@ class AbstractAuth(ABC):
     tokens outside this package and implement ``async_get_access_token``.
     """
 
-    def __init__(self, websession: ClientSession, host: str = DIGITAL_TWIN_HOST) -> None:
+    def __init__(
+        self,
+        websession: ClientSession,
+        host: str = DIGITAL_TWIN_HOST,
+        *,
+        timeout: ClientTimeout | None = None,
+    ) -> None:
         """Initialize the auth."""
         self.websession = websession
         self.host = host.rstrip("/")
+        self.timeout = timeout if timeout is not None else ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
 
     @abstractmethod
     async def async_get_access_token(self) -> str:
         """Return a valid access token."""
+
+    async def async_force_refresh(self) -> None:
+        """Refresh after the server rejected the access token.
+
+        The default asks for a token again. ``SmartHQAuth`` drops ``expires_at``
+        first so a token that still looks current is not reused.
+        """
+        await self.async_get_access_token()
 
     async def request(self, method: str, url: str, **kwargs: Any) -> ClientResponse:
         """Make a request to the Digital Twin host.
@@ -195,6 +220,8 @@ class AbstractAuth(ABC):
             full_url = url
         else:
             full_url = f"{self.host}/{url.lstrip('/')}"
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = self.timeout
         return await self.websession.request(method, full_url, **kwargs, headers=headers)
 
 
@@ -216,42 +243,79 @@ class SmartHQAuth(AbstractAuth):
         token_updater: TokenUpdater | None = None,
         host: str = DIGITAL_TWIN_HOST,
         iam_host: str = IAM_HOST,
+        timeout: ClientTimeout | None = None,
     ) -> None:
         """Initialize the auth."""
-        super().__init__(websession, host)
+        super().__init__(websession, host, timeout=timeout)
         self.token = dict(token)
         self._client_id = client_id
         self._client_secret = client_secret
         self._token_updater = token_updater
         self._iam_host = iam_host
         self._lock = asyncio.Lock()
+        self._persist_pending = False
+        self._force_refresh = False
+
+    async def async_force_refresh(self) -> None:
+        """Refresh even when ``expires_at`` still looks current.
+
+        Used after HTTP 401. The flag is consumed by the next
+        ``async_get_access_token``, which exchanges the refresh token.
+        """
+        async with self._lock:
+            self._force_refresh = True
+        await self.async_get_access_token()
 
     async def async_get_access_token(self) -> str:
-        """Return the current access token, refreshing it when ``expires_at`` has passed."""
+        """Return the current access token, refreshing it shortly before ``expires_at``."""
         async with self._lock:
-            if _token_is_current(self.token):
+            force = self._force_refresh
+            self._force_refresh = False
+            if self._persist_pending and not force and _token_is_current(self.token):
+                await self._persist_token()
+                return str(self.token["access_token"])
+            if not force and _token_is_current(self.token):
                 return str(self.token["access_token"])
             refresh_token = self.token.get("refresh_token")
             if not refresh_token or not self._client_id or not self._client_secret:
                 raise SmartHQAuthError(
                     "Access token is expired and no refresh token and client credentials are available"
                 )
-            self.token = await async_refresh_token(
+            refreshed = await async_refresh_token(
                 self.websession,
                 client_id=self._client_id,
                 client_secret=self._client_secret,
                 refresh_token=str(refresh_token),
                 host=self._iam_host,
+                timeout=self.timeout,
             )
-            updater = self._token_updater
-            if updater is not None:
-                result = updater(dict(self.token))
-                if result is not None:
-                    await result
+            if "refresh_token" not in refreshed:
+                refreshed["refresh_token"] = refresh_token
+            self.token = refreshed
+            await self._persist_token()
             access_token = self.token.get("access_token")
             if not access_token:
                 raise SmartHQAuthError("Token response did not include access_token")
             return str(access_token)
+
+    async def _persist_token(self) -> None:
+        """Hand the token dict to ``token_updater``.
+
+        On failure the rotated token stays in ``self.token`` and the next
+        ``async_get_access_token`` retries this method without another refresh.
+        """
+        updater = self._token_updater
+        if updater is None:
+            self._persist_pending = False
+            return
+        try:
+            result = updater(dict(self.token))
+            if result is not None:
+                await result
+        except Exception:
+            self._persist_pending = True
+            raise
+        self._persist_pending = False
 
 
 def _oauth_page_url(
@@ -290,9 +354,15 @@ async def _async_token(
     form: Mapping[str, str],
     *,
     host: str,
+    timeout: ClientTimeout | None = None,
 ) -> dict[str, Any]:
     url = f"{host.rstrip('/')}/oauth2/token"
-    response = await websession.request("POST", url, data=dict(form))
+    response = await websession.request(
+        "POST",
+        url,
+        data=dict(form),
+        timeout=timeout if timeout is not None else ClientTimeout(total=REQUEST_TIMEOUT_SECONDS),
+    )
     try:
         text = await response.text()
     finally:
@@ -337,6 +407,6 @@ def _token_is_current(token: Mapping[str, Any]) -> bool:
     if not access_token:
         return False
     expires_at = token.get("expires_at")
-    if expires_at is None:
-        return True
-    return time.time() < float(expires_at)
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        return False
+    return time.time() < float(expires_at) - ACCESS_TOKEN_REFRESH_LEEWAY_SECONDS

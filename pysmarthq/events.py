@@ -19,13 +19,19 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Mapping
 from typing import Any
 
-from aiohttp import WSMsgType
+from aiohttp import ClientWSTimeout, WSMsgType
 
 from .auth import AbstractAuth
-from ._http import async_api
-from .const import WEBSOCKET_IDLE_PING_SECONDS, WEBSOCKET_MAX_PAYLOAD_BYTES
+from ._http import async_api, redact_access_token
+from .const import (
+    REQUEST_TIMEOUT_SECONDS,
+    WEBSOCKET_IDLE_PING_SECONDS,
+    WEBSOCKET_INBOUND_GRACE_INTERVALS,
+    WEBSOCKET_MAX_PAYLOAD_BYTES,
+)
 from .errors import SmartHQError, SmartHQStreamClosed
 from .models import WebsocketEndpoint
 
@@ -354,8 +360,11 @@ class EventStream:
     """WebSocket event stream for one SmartHQ user.
 
     The caller owns the aiohttp session on ``auth``. This client fetches a new
-    endpoint on each ``async_connect`` and does not reconnect on its own: when
-    the access token expires, SmartHQ closes the socket.
+    endpoint on each ``async_connect`` and does not reconnect on its own.
+    Home Assistant should schedule that from ``socket_expires_at``: the socket
+    is tied to the access token in its URL and still closes at that expiry.
+    ``async_connect`` closes any current socket and sends the last account and
+    device configuration messages again.
     """
 
     def __init__(
@@ -367,30 +376,56 @@ class EventStream:
         """Initialize the stream.
 
         ``idle_ping_seconds`` is the documented quiet period before a
-        ``websocket#ping``. Pass ``None`` to disable that ping.
+        ``websocket#ping``. Pass ``None`` to disable that ping. With pinging
+        enabled, the socket fails when no inbound frame arrives within about
+        two ping intervals.
         """
         self.auth = auth
         self.idle_ping_seconds = idle_ping_seconds
         self.endpoint: WebsocketEndpoint | None = None
+        self.socket_expires_at: float | None = None
+        self._account_config: dict[str, Any] | None = None
+        self._device_configs: dict[str, dict[str, Any]] = {}
         self._ws: Any = None
         self._keepalive: asyncio.Task[None] | None = None
         self._last_activity = 0.0
+        self._last_inbound = 0.0
+        self._closed_error: SmartHQStreamClosed | None = None
 
     async def async_connect(self) -> WebsocketEndpoint:
         """Fetch ``GET /v2/websocket`` and connect to the returned URL.
 
+        Closes the current socket first. After the handshake, sends the last
+        account configuration and the last configuration for each device again.
         The connect acknowledgement is not consumed. Read it with
-        ``async_receive``.
+        ``async_receive``. ``socket_expires_at`` is the token expiry baked into
+        this URL.
         """
+        await self.async_close()
+        self.endpoint = None
+        self.socket_expires_at = None
         data = await async_api(self.auth, "GET", "v2/websocket")
         endpoint = WebsocketEndpoint(data, self.auth)
         if not endpoint.endpoint:
             raise SmartHQError("GET /v2/websocket did not include endpoint", body=data)
+        try:
+            async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
+                socket = await self.auth.websession.ws_connect(
+                    endpoint.endpoint,
+                    timeout=ClientWSTimeout(ws_close=float(REQUEST_TIMEOUT_SECONDS)),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            raise SmartHQError(redact_access_token(str(err))) from None
+        self._ws = socket
         self.endpoint = endpoint
-        self._ws = await self.auth.websession.ws_connect(endpoint.endpoint)
-        self._touch()
+        self.socket_expires_at = _token_expires_at(self.auth)
+        self._closed_error = None
+        self._note_inbound()
         if self.idle_ping_seconds:
             self._keepalive = asyncio.create_task(self._keepalive_loop())
+        await self._replay_configuration()
         return endpoint
 
     async def async_configure_account(
@@ -413,6 +448,7 @@ class EventStream:
             "pubsub": pubsub,
         }
         _put_optional(payload, services=services, presence=presence, alerts=alerts, commands=commands)
+        self._account_config = dict(payload)
         await self._send(payload)
 
     async def async_configure_device(
@@ -436,6 +472,7 @@ class EventStream:
             "deviceId": device_id,
         }
         _put_optional(payload, services=services, presence=presence, alerts=alerts, commands=commands)
+        self._device_configs[device_id] = dict(payload)
         await self._send(payload)
 
     async def async_ping(self, id: str | None = None) -> None:
@@ -448,17 +485,25 @@ class EventStream:
     async def async_receive(self) -> Event:
         """Read the next event message.
 
-        Protocol-level ping and pong frames are ignored. A closed socket raises
-        ``SmartHQStreamClosed``.
+        Protocol-level ping frames are ignored. A pong or an event counts as
+        inbound traffic. A closed socket raises ``SmartHQStreamClosed`` with
+        the close code and reason when the peer sent them.
         """
+        if self._closed_error is not None:
+            raise self._closed_error
         ws = self._require_ws()
         while True:
             message = await ws.receive()
+            if self._closed_error is not None:
+                raise self._closed_error
             kind = message.type
-            if kind in (WSMsgType.PING, WSMsgType.PONG):
+            if kind == WSMsgType.PONG:
+                self._note_inbound()
+                continue
+            if kind == WSMsgType.PING:
                 continue
             if kind == WSMsgType.TEXT:
-                self._touch()
+                self._note_inbound()
                 try:
                     payload = json.loads(message.data)
                 except json.JSONDecodeError as err:
@@ -468,35 +513,33 @@ class EventStream:
                 return parse_event(payload)
             if kind == WSMsgType.BINARY:
                 raise SmartHQError("Unexpected binary WebSocket frame")
-            if kind in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED):
-                raise SmartHQStreamClosed("WebSocket connection closed")
-            if kind == WSMsgType.ERROR:
-                raise SmartHQError("WebSocket connection failed")
+            if kind in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
+                raise _stream_closed(message)
             raise SmartHQError(f"Unsupported WebSocket frame type {kind}")
 
     def __aiter__(self) -> EventStream:
         return self
 
     async def __anext__(self) -> Event:
-        try:
-            return await self.async_receive()
-        except SmartHQStreamClosed as err:
-            raise StopAsyncIteration from err
+        return await self.async_receive()
 
     async def async_close(self) -> None:
-        """Stop the idle ping and close the socket."""
+        """Stop the idle ping and close the socket.
+
+        The socket is closed even when the ping task has already failed.
+        Stored event configuration is kept for the next ``async_connect``.
+        """
         task = self._keepalive
         self._keepalive = None
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        ws = self._ws
-        self._ws = None
-        if ws is not None and not getattr(ws, "closed", False):
-            await ws.close()
+        try:
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            await self._close_socket()
 
     async def __aenter__(self) -> EventStream:
         await self.async_connect()
@@ -505,12 +548,18 @@ class EventStream:
     async def __aexit__(self, *_exc: object) -> None:
         await self.async_close()
 
+    async def _replay_configuration(self) -> None:
+        if self._account_config is not None:
+            await self._send(dict(self._account_config))
+        for payload in self._device_configs.values():
+            await self._send(dict(payload))
+
     async def _send(self, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload).encode()
         if len(encoded) > WEBSOCKET_MAX_PAYLOAD_BYTES:
             raise SmartHQError("WebSocket payload exceeds 32 KB")
         await self._require_ws().send_str(encoded.decode())
-        self._touch()
+        self._note_outbound()
 
     async def _keepalive_loop(self) -> None:
         interval = self.idle_ping_seconds
@@ -523,16 +572,64 @@ class EventStream:
                     return
                 if time.monotonic() - self._last_activity >= interval:
                     await self.async_ping()
+                if self._ws is None:
+                    return
+                if time.monotonic() - self._last_inbound >= interval * WEBSOCKET_INBOUND_GRACE_INTERVALS:
+                    self._closed_error = SmartHQStreamClosed(
+                        "No inbound WebSocket frame within the grace period"
+                    )
+                    await self._close_socket()
+                    return
         except asyncio.CancelledError:
             raise
 
-    def _touch(self) -> None:
+    async def _close_socket(self) -> None:
+        ws = self._ws
+        self._ws = None
+        if ws is not None and not getattr(ws, "closed", False):
+            await ws.close()
+
+    def _note_outbound(self) -> None:
         self._last_activity = time.monotonic()
+
+    def _note_inbound(self) -> None:
+        now = time.monotonic()
+        self._last_inbound = now
+        self._last_activity = now
 
     def _require_ws(self) -> Any:
         if self._ws is None:
             raise SmartHQError("Event stream is not connected")
         return self._ws
+
+
+def _token_expires_at(auth: AbstractAuth) -> float | None:
+    token = getattr(auth, "token", None)
+    if not isinstance(token, Mapping):
+        return None
+    expires_at = token.get("expires_at")
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        return None
+    return float(expires_at)
+
+
+def _stream_closed(message: Any) -> SmartHQStreamClosed:
+    data = getattr(message, "data", None)
+    extra = getattr(message, "extra", None)
+    if getattr(message, "type", None) == WSMsgType.ERROR:
+        detail = data if data else extra
+        text = "WebSocket connection failed" if not detail else f"WebSocket connection failed: {detail}"
+        return SmartHQStreamClosed(text)
+    code = data if isinstance(data, int) and not isinstance(data, bool) else None
+    reason = extra if isinstance(extra, str) and extra else None
+    if code is None and reason is None:
+        return SmartHQStreamClosed("WebSocket connection closed")
+    parts = ["WebSocket connection closed"]
+    if code is not None:
+        parts.append(f"code {code}")
+    if reason:
+        parts.append(reason)
+    return SmartHQStreamClosed(" ".join(parts), code=code, reason=reason)
 
 
 def _put_optional(payload: dict[str, Any], **flags: bool | None) -> None:

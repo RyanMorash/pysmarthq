@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from collections.abc import Mapping
+
 from .auth import AbstractAuth
-from ._http import api_path, async_api
-from .errors import SmartHQError
+from ._http import api_path, async_api, redact_access_token
+from .errors import SmartHQApiError, SmartHQError
 
 
 class ApiModel:
@@ -27,6 +29,11 @@ class ApiModel:
 
 class Device(ApiModel):
     """A device from ``Device`` or ``DeviceResponse``."""
+
+    def __init__(self, raw_data: dict[str, Any], auth: AbstractAuth) -> None:
+        super().__init__(raw_data, auth)
+        self._services: list[Service] | None = None
+        self._services_list: list[Any] | None = None
 
     @property
     def deviceId(self) -> str | None:
@@ -155,13 +162,89 @@ class Device(ApiModel):
 
     @property
     def services(self) -> list[Service] | None:
-        """Services on a device detail. ``None`` when the payload has no ``services``."""
+        """Services on a device detail. ``None`` when the payload has no ``services``.
+
+        The ``Service`` objects are cached. ``Service.async_update`` writes the
+        new detail back into ``raw_data["services"]`` and into that cache, so a
+        later read sees the refresh.
+        """
         if "services" not in self.raw_data:
+            self._services = None
+            self._services_list = None
             return None
-        return [
-            Service(item, self.auth, deviceId=self.deviceId)
-            for item in self.raw_data.get("services") or []
-        ]
+        items = self.raw_data.get("services") or []
+        if not isinstance(items, list):
+            self._services = None
+            self._services_list = None
+            return None
+        if self._services is None or self._services_list is not items:
+            self._services = [
+                Service(item, self.auth, deviceId=self.deviceId, device=self)
+                for item in items
+                if isinstance(item, dict)
+            ]
+            self._services_list = items
+        return self._services
+
+    def find_service(
+        self,
+        serviceType: str,
+        *,
+        domainType: str | None = None,
+        serviceDeviceType: str | None = None,
+    ) -> Service | None:
+        """Return the one service matching ``serviceType`` and any extra keys.
+
+        Several services share a service type (temperature domains, more than
+        one toggle). When more than one service matches the keys that were
+        passed, this returns ``None`` instead of picking the first.
+        """
+        matches: list[Service] = []
+        for service in self.services or []:
+            if service.serviceType != serviceType:
+                continue
+            if domainType is not None and service.domainType != domainType:
+                continue
+            if serviceDeviceType is not None and service.serviceDeviceType != serviceDeviceType:
+                continue
+            matches.append(service)
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def apply_event(self, event: Mapping[str, Any] | Any) -> None:
+        """Copy an event payload onto this device without renaming fields.
+
+        ``pubsub#service`` updates ``state``, ``config``, ``lastSyncTime``, and
+        ``lastStateTime`` on the matching service when those keys are present.
+        ``pubsub#presence`` sets ``presence`` and ``lastSyncTime``.
+        ``pubsub#alert`` stores the alert fields the payload has (``clear``
+        stays a string) and applies each nested service the same way.
+        ``pubsub#device`` copies ``config`` and ``supportedCommands`` from the
+        embedded services and does not clear ``state`` when the event omits it.
+        ``created`` and ``removed`` are device-registry events; this object
+        does not add or remove itself.
+        """
+        payload = getattr(event, "raw_data", event)
+        if not isinstance(payload, dict):
+            raise SmartHQError("Event payload was not an object")
+        kind = payload.get("kind")
+        if kind == "pubsub#service":
+            _copy_service_fields(self, payload, _SERVICE_EVENT_FIELDS)
+        elif kind == "pubsub#presence":
+            for key in ("presence", "lastSyncTime"):
+                if key in payload:
+                    self.raw_data[key] = payload[key]
+        elif kind == "pubsub#alert":
+            _apply_alert(self, payload)
+        elif kind == "pubsub#device":
+            for item in payload.get("services") or []:
+                if isinstance(item, dict):
+                    _copy_service_fields(self, item, _DEVICE_EVENT_FIELDS)
+        elif kind in ("pubsub#command", "websocket#connect", "websocket#pong", "websocket#pubsub"):
+            return
+        else:
+            raise SmartHQError(f"Unsupported event kind {kind!r}")
 
     async def async_update(self) -> None:
         """Replace this device with ``GET /v2/device/{deviceId}``."""
@@ -174,6 +257,7 @@ class Device(ApiModel):
             "DELETE",
             _device_path(self._require_device_id()),
             ok=(204,),
+            expect_object=False,
         )
 
     async def async_get_service(self, service_id: str) -> Service:
@@ -184,7 +268,7 @@ class Device(ApiModel):
             "GET",
             _device_path(device_id, "service", service_id),
         )
-        return Service(data, self.auth, deviceId=device_id)
+        return Service(data, self.auth, deviceId=device_id, device=self)
 
     async def async_get_presence(self) -> DevicePresenceResponse:
         """Return ``GET /v2/device/{deviceId}/presence``."""
@@ -250,7 +334,9 @@ class Device(ApiModel):
             command=command,
         )
         data = await async_api(self.auth, "POST", "v2/command", json_body=body)
-        return CommandResponse(data, self.auth)
+        result = CommandResponse(data, self.auth)
+        result.raise_for_outcome()
+        return result
 
     async def async_get_pubsub(self) -> PubsubConfig:
         """Return ``GET /v2/device/{deviceId}/pubsub``."""
@@ -295,6 +381,7 @@ class Device(ApiModel):
             "DELETE",
             _device_path(self._require_device_id(), "pubsub"),
             ok=(204,),
+            expect_object=False,
         )
 
     def _require_device_id(self) -> str:
@@ -372,9 +459,11 @@ class Service(ApiModel):
         auth: AbstractAuth,
         *,
         deviceId: str | None = None,
+        device: Device | None = None,
     ) -> None:
         super().__init__(raw_data, auth)
         self._deviceId = deviceId or raw_data.get("deviceId")
+        self._device = device
 
     @property
     def serviceId(self) -> str | None:
@@ -432,11 +521,27 @@ class Service(ApiModel):
         return self._value("lastStateTime")
 
     async def async_update(self) -> None:
-        """Replace this service with ``GET /v2/device/{deviceId}/service/{serviceId}``."""
+        """Replace this service with ``GET /v2/device/{deviceId}/service/{serviceId}``.
+
+        When this service belongs to a ``Device``, the new payload replaces
+        that service's entry in ``device.raw_data["services"]``.
+        """
         data = await async_api(self.auth, "GET", self._detail_path())
+        previous_id = self.serviceId
         device_id = self._deviceId
         self.raw_data = data
         self._deviceId = device_id or data.get("deviceId")
+        device = self._device
+        if device is None:
+            return
+        services = device.raw_data.get("services")
+        if not isinstance(services, list):
+            return
+        service_id = self.serviceId or previous_id
+        for index, item in enumerate(services):
+            if isinstance(item, dict) and item.get("serviceId") == service_id:
+                services[index] = self.raw_data
+                return
 
     async def async_send_command(self, command: dict[str, Any]) -> CommandResponse:
         """Send ``POST /v2/command`` using this service's type fields."""
@@ -456,7 +561,9 @@ class Service(ApiModel):
             command=command,
         )
         data = await async_api(self.auth, "POST", "v2/command", json_body=body)
-        return CommandResponse(data, self.auth)
+        result = CommandResponse(data, self.auth)
+        result.raise_for_outcome()
+        return result
 
     def _detail_path(self) -> str:
         device_id = self.deviceId
@@ -621,6 +728,25 @@ class CommandResponse(ApiModel):
     def services(self) -> list[str] | None:
         """Service ids included on the response."""
         return self._value("services")
+
+    def raise_for_outcome(self) -> None:
+        """Raise ``SmartHQApiError`` when ``success`` is false.
+
+        ``POST /v2/command`` returns HTTP 200 for a processed command. Callers
+        that only catch transport errors would otherwise treat ``success``
+        false, including ``cloud.smarthq.outcome.timeout``, as success.
+        ``Device.async_send_command`` and ``Service.async_send_command`` call
+        this. ``SmartHQApi.async_send_command`` returns the raw object.
+        A later ``pubsub#command`` event can still carry the final device
+        outcome; ``commands: true`` on the account configuration delivers it.
+        """
+        if self.success is False:
+            outcome = self.outcome or "unknown"
+            raise SmartHQApiError(
+                f"Command was not successful ({outcome})",
+                status=200,
+                body=self.raw_data,
+            )
 
 
 class SendCommandsSuccessResponse(ApiModel):
@@ -862,7 +988,12 @@ class PubsubConfig(ApiModel):
 
     @property
     def pubsub(self) -> bool | None:
-        """Whether account or device pubsub is enabled."""
+        """Whether account or device pubsub is enabled.
+
+        ``GET`` pubsub responses require ``services``, ``presence``, ``alerts``,
+        and ``commands``, and they do not list ``pubsub``. ``None`` means the
+        field was absent. It does not mean pubsub is off.
+        """
         return self._value("pubsub")
 
     @property
@@ -903,6 +1034,77 @@ class WebsocketEndpoint(ApiModel):
     def endpoint(self) -> str | None:
         """WebSocket URL. The access token is already part of this URL."""
         return self._value("endpoint")
+
+    def __repr__(self) -> str:
+        endpoint = self.endpoint
+        shown = redact_access_token(endpoint) if isinstance(endpoint, str) else endpoint
+        return f"WebsocketEndpoint(endpoint={shown!r})"
+
+
+_SERVICE_EVENT_FIELDS = ("state", "config", "lastSyncTime", "lastStateTime")
+_DEVICE_EVENT_FIELDS = ("config", "supportedCommands")
+_ALERT_SKIP_FIELDS = {"kind", "services"}
+
+
+def _service_for_event(device: Device, payload: Mapping[str, Any]) -> Service | None:
+    service_id = payload.get("serviceId")
+    if isinstance(service_id, str) and service_id:
+        for service in device.services or []:
+            if service.serviceId == service_id:
+                return service
+        return None
+    service_type = payload.get("serviceType")
+    if not isinstance(service_type, str):
+        return None
+    domain = payload.get("domainType")
+    service_device = payload.get("serviceDeviceType")
+    return device.find_service(
+        service_type,
+        domainType=domain if isinstance(domain, str) else None,
+        serviceDeviceType=service_device if isinstance(service_device, str) else None,
+    )
+
+
+def _copy_service_fields(device: Device, payload: Mapping[str, Any], keys: tuple[str, ...]) -> None:
+    service = _service_for_event(device, payload)
+    if service is None:
+        return
+    for key in keys:
+        if key in payload:
+            service.raw_data[key] = payload[key]
+
+
+def _apply_alert(device: Device, payload: Mapping[str, Any]) -> None:
+    stored = {key: value for key, value in payload.items() if key not in _ALERT_SKIP_FIELDS}
+    alerts = device.raw_data.get("alerts")
+    if not isinstance(alerts, list):
+        alerts = []
+        device.raw_data["alerts"] = alerts
+    index = _alert_index(alerts, stored)
+    if index is None:
+        alerts.append(stored)
+    else:
+        current = alerts[index]
+        if isinstance(current, dict):
+            current.update(stored)
+        else:
+            alerts[index] = stored
+    for item in payload.get("services") or []:
+        if isinstance(item, dict):
+            _copy_service_fields(device, item, _SERVICE_EVENT_FIELDS)
+
+
+def _alert_index(alerts: list[Any], stored: Mapping[str, Any]) -> int | None:
+    alert_id = stored.get("alertId")
+    alert_type = stored.get("alertType")
+    for index, item in enumerate(alerts):
+        if not isinstance(item, dict):
+            continue
+        if alert_id is not None and item.get("alertId") == alert_id:
+            return index
+        if alert_id is None and alert_type is not None and item.get("alertType") == alert_type:
+            return index
+    return None
 
 
 def _device_path(device_id: str, *rest: str) -> str:

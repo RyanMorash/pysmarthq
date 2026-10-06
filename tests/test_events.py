@@ -8,30 +8,48 @@ import json
 import pytest
 from aiohttp import WSMsgType
 
-from pysmarthq import EventStream, SmartHQApiError, SmartHQAuth, SmartHQError, SmartHQStreamClosed
+from pysmarthq import EventStream, SmartHQAuth, SmartHQAuthError, SmartHQError, SmartHQStreamClosed
 from pysmarthq.events import AlertEvent, ConnectionEvent, PresenceEvent, PubsubAckEvent, ServiceEvent
 
 from tests.mock_http import MockSession, Response
 
 
 class FakeSocket:
-    def __init__(self, incoming: list[dict]) -> None:
+    def __init__(
+        self,
+        incoming: list[dict],
+        *,
+        close_code: int | None = None,
+        close_reason: str | None = None,
+        block_until_closed: bool = False,
+    ) -> None:
         self.incoming = [
             type("Frame", (), {"type": WSMsgType.TEXT, "data": json.dumps(item)})() for item in incoming
         ]
         self.sent: list[str] = []
         self.closed = False
+        self.close_code = close_code
+        self.close_reason = close_reason
+        self.block_until_closed = block_until_closed
+        self._closed_event = asyncio.Event()
 
     async def send_str(self, data: str) -> None:
         self.sent.append(data)
 
     async def receive(self):
-        if not self.incoming:
-            return type("Frame", (), {"type": WSMsgType.CLOSE, "data": None})()
-        return self.incoming.pop(0)
+        if self.incoming:
+            return self.incoming.pop(0)
+        if self.block_until_closed:
+            await self._closed_event.wait()
+        return type(
+            "Frame",
+            (),
+            {"type": WSMsgType.CLOSE, "data": self.close_code, "extra": self.close_reason},
+        )()
 
     async def close(self) -> None:
         self.closed = True
+        self._closed_event.set()
 
 
 def _session(socket: FakeSocket, *, websocket_status: int = 200) -> MockSession:
@@ -179,7 +197,7 @@ async def test_closed_socket_and_oversized_payload() -> None:
 async def test_websocket_http_error_does_not_open_a_socket() -> None:
     session = _session(FakeSocket([]), websocket_status=401)
     stream = EventStream(_auth(session), idle_ping_seconds=None)
-    with pytest.raises(SmartHQApiError) as caught:
+    with pytest.raises(SmartHQAuthError) as caught:
         await stream.async_connect()
     assert caught.value.status == 401
     assert all(item["method"] != "WS" for item in session.requests)
@@ -196,3 +214,110 @@ async def test_idle_ping_follows_quiet_time() -> None:
     assert sent[0]["kind"] == "websocket#ping"
     assert sent[0]["action"] == "ping"
     await stream.async_close()
+
+
+@pytest.mark.asyncio
+async def test_async_for_raises_stream_closed_with_the_close_code() -> None:
+    socket = FakeSocket(
+        [{"kind": "websocket#connect", "success": True}],
+        close_code=1000,
+        close_reason="expired",
+    )
+    stream = EventStream(_auth(_session(socket)), idle_ping_seconds=None)
+    await stream.async_connect()
+    seen = []
+    with pytest.raises(SmartHQStreamClosed) as caught:
+        async for event in stream:
+            seen.append(event)
+    assert len(seen) == 1
+    assert caught.value.code == 1000
+    assert caught.value.reason == "expired"
+    assert "1000" in str(caught.value)
+    await stream.async_close()
+
+
+@pytest.mark.asyncio
+async def test_second_connect_closes_the_first_socket_and_replays_config() -> None:
+    first = FakeSocket([])
+    second = FakeSocket([])
+    session = _session(first)
+    session.ws = [first, second]
+    stream = EventStream(_auth(session), idle_ping_seconds=None)
+    await stream.async_connect()
+    await stream.async_configure_account(pubsub=True, services=True, presence=True)
+    await stream.async_configure_device("device-1", services=True)
+    await stream.async_connect()
+    assert first.closed
+    assert second.closed is False
+    sent = [json.loads(item) for item in second.sent]
+    assert sent[0]["pubsub"] is True
+    assert sent[0]["services"] is True
+    assert sent[1]["deviceId"] == "device-1"
+    assert stream.socket_expires_at == 9_999_999_999
+    await stream.async_close()
+
+
+@pytest.mark.asyncio
+async def test_ping_task_failure_still_closes_the_socket() -> None:
+    class BoomSocket(FakeSocket):
+        async def send_str(self, data: str) -> None:
+            raise RuntimeError("send failed")
+
+    socket = BoomSocket([])
+    stream = EventStream(_auth(_session(socket)), idle_ping_seconds=0.05)
+    await stream.async_connect()
+    task = stream._keepalive
+    assert task is not None
+    for _ in range(50):
+        if task.done():
+            break
+        await asyncio.sleep(0.02)
+    assert task.done()
+    with pytest.raises(RuntimeError, match="send failed"):
+        await stream.async_close()
+    assert socket.closed
+
+
+@pytest.mark.asyncio
+async def test_no_inbound_frame_within_the_grace_period() -> None:
+    socket = FakeSocket([], block_until_closed=True)
+    stream = EventStream(_auth(_session(socket)), idle_ping_seconds=0.05)
+    await stream.async_connect()
+    with pytest.raises(SmartHQStreamClosed, match="inbound"):
+        await asyncio.wait_for(stream.async_receive(), timeout=1)
+    assert socket.closed
+    await stream.async_close()
+
+
+@pytest.mark.asyncio
+async def test_connect_failure_redacts_the_access_token() -> None:
+    from aiohttp import ClientError
+
+    from pysmarthq.models import WebsocketEndpoint
+
+    session = MockSession()
+    session.routes[("GET", "/v2/websocket")] = Response(
+        200,
+        {
+            "kind": "websocket#endpoint",
+            "endpoint": "wss://example.com/socket?access_token=secret-token",
+        },
+    )
+
+    async def fail_connect(url: str, **kwargs: object) -> None:
+        session.requests.append({"method": "WS", "url": url, **kwargs})
+        raise ClientError(f"Cannot connect to host {url}")
+
+    session.ws_connect = fail_connect  # type: ignore[method-assign]
+    stream = EventStream(_auth(session), idle_ping_seconds=None)
+    with pytest.raises(SmartHQError) as caught:
+        await stream.async_connect()
+    assert "secret-token" not in str(caught.value)
+    assert "REDACTED" in str(caught.value)
+    assert caught.value.__cause__ is None
+    shown = WebsocketEndpoint(
+        {"endpoint": "wss://example.com/socket?access_token=secret-token&x=1"},
+        stream.auth,
+    )
+    assert "secret-token" not in repr(shown)
+    assert "REDACTED" in repr(shown)

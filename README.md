@@ -112,7 +112,11 @@ asyncio.run(main())
 
 `GET /oauth2/auth` and `GET /oauth2/register` return a SmartHQ web page. `GET /oauth2/applogout` clears that browser session and does not revoke tokens. Build those URLs with `authorization_url`, `registration_url`, and `logout_url`.
 
-Access tokens are bearer tokens for the Digital Twin API. `SmartHQAuth` calls `POST /oauth2/token` with `grant_type=refresh_token` after the local `expires_at` (computed from `expires_in` when the token response arrives). A Home Assistant install that refreshes tokens through account linking can subclass `AbstractAuth` and implement `async_get_access_token` instead.
+Access tokens are bearer tokens for the Digital Twin API. `SmartHQAuth` calls `POST /oauth2/token` with `grant_type=refresh_token` when `expires_at` is missing or fewer than 60 seconds remain. `expires_at` is computed from `expires_in` when the token response arrives. A refresh response that omits `refresh_token` keeps the previous value. If `token_updater` raises, the new token stays in memory and the next `async_get_access_token` retries the updater without another token request. Do not call the client from `token_updater`; it runs inside the refresh lock. A Home Assistant install that refreshes tokens through account linking can subclass `AbstractAuth` and implement `async_get_access_token` instead.
+
+An HTTP 401 refreshes once and retries. A second 401, or a failed refresh, raises `SmartHQAuthError`. HTTP 403 stays `SmartHQApiError`.
+
+`async_get_devices` returns one page. `async_get_all_devices` asks for 100 devices per page and follows `page` until `total` is covered or a short page comes back. List payloads do not include services; load `GET /v2/device/{deviceId}` before creating entities.
 
 A single-device command uses the `service#command` body from `POST /v2/command`:
 
@@ -125,7 +129,11 @@ await device.async_send_command(
 )
 ```
 
-WebSocket event preferences are messages on the socket (`kind` `websocket#pubsub`). HTTPS/SNS preferences are `POST /v2/pubsub` and `POST /v2/device/{deviceId}/pubsub` (`kind` `user#pubsub` or `device#pubsub`). The two channels do not affect each other. The WebSocket URL from `GET /v2/websocket` already includes the access token; fetch it again for every connection. SmartHQ closes the socket when the access token expires (the guide describes a one-hour lifetime; the token response's `expires_in` is what this client uses).
+`Device.async_send_command` and `Service.async_send_command` raise `SmartHQApiError` when HTTP 200 comes back with `success: false` (`CommandResponse.raise_for_outcome`). `SmartHQApi.async_send_command` returns that body unchanged. `POST /v2/commands` requires at least one device filter (`deviceId`, `deviceType`, or the other device-list filters). With none set, the call would match every device that has the service.
+
+WebSocket event preferences are messages on the socket (`kind` `websocket#pubsub`). HTTPS/SNS preferences are `POST /v2/pubsub` and `POST /v2/device/{deviceId}/pubsub` (`kind` `user#pubsub` or `device#pubsub`). The two channels do not affect each other. The WebSocket URL from `GET /v2/websocket` already includes the access token; fetch it again for every connection. `async_connect` closes the previous socket and sends the last account and per-device configuration again. `socket_expires_at` is the expiry of the token in that URL; schedule the next connect from it. The client does not run a reconnect loop. `async for` raises `SmartHQStreamClosed` when the socket closes, with the close code and reason when the peer sent them. A ping only proves the write was accepted: if no inbound frame arrives within about two ping intervals, the stream raises `SmartHQStreamClosed`.
+
+`Device.apply_event` copies `pubsub#service`, `pubsub#presence`, `pubsub#alert`, and `pubsub#device` fields onto the device. `Device.find_service` matches `serviceType` plus optional `domainType` and `serviceDeviceType`. `GET` pubsub bodies omit `pubsub`; `PubsubConfig.pubsub is None` means the field was absent, not that pubsub is off.
 
 ## Tests
 
