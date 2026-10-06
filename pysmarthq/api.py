@@ -6,11 +6,13 @@ from typing import Any
 
 from .auth import AbstractAuth
 from ._http import api_path, async_api
+from .const import DEVICE_LIST_PAGE_SIZE, DEVICE_QUERY_FILTERS
 from .models import (
     AccountCommandHistoryResponse,
     BatchCommandHistoryResponse,
     CommandOutcomeSummaryResponse,
     CommandResponse,
+    Device,
     DeviceCountResponse,
     DeviceListResponse,
     GetCommandOutcomeResponse,
@@ -39,6 +41,38 @@ class SmartHQApi:
         data = await async_api(self.auth, "GET", "v2/device", params=params)
         return DeviceListResponse(data, self.auth)
 
+    async def async_get_all_devices(self, *, params: dict[str, Any] | None = None) -> list[Device]:
+        """Return every device from ``GET /v2/device``.
+
+        Requests ``perpage`` of 100 and follows ``page`` until ``page * perpage``
+        reaches ``total`` or a short page comes back. ``async_get_devices``
+        still returns one page. Other query parameters, including device
+        filters, are sent on every page.
+        """
+        filters = {
+            key: value
+            for key, value in (params or {}).items()
+            if key not in ("page", "perpage") and value is not None
+        }
+        page = 1
+        devices: list[Device] = []
+        while True:
+            listed = await self.async_get_devices(
+                params={**filters, "page": page, "perpage": DEVICE_LIST_PAGE_SIZE}
+            )
+            batch = listed.devices
+            devices.extend(batch)
+            size = listed.perpage if isinstance(listed.perpage, int) and listed.perpage > 0 else DEVICE_LIST_PAGE_SIZE
+            current = listed.page if isinstance(listed.page, int) and listed.page > 0 else page
+            total = listed.total
+            if (
+                not batch
+                or len(batch) < size
+                or (isinstance(total, int) and not isinstance(total, bool) and current * size >= total)
+            ):
+                return devices
+            page = current + 1
+
     async def async_get_device(self, device_id: str) -> Device:
         """Return ``GET /v2/device/{deviceId}``, including services."""
         data = await async_api(self.auth, "GET", api_path("v2", "device", device_id))
@@ -58,14 +92,23 @@ class SmartHQApi:
         data = await async_api(self.auth, "POST", "v2/command", json_body=dict(body))
         return CommandResponse(data, self.auth)
 
-    async def async_send_commands(self, body: dict[str, Any]) -> SendCommandsSuccessResponse:
+    async def async_send_commands(
+        self,
+        body: dict[str, Any],
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> SendCommandsSuccessResponse:
         """Send ``POST /v2/commands``.
 
         ``SendCommandsRequest`` requires ``kind``, ``serviceType``, ``domainType``,
-        ``serviceDeviceType``, and ``command``.
+        ``serviceDeviceType``, and ``command``. Device selection is the query
+        string. At least one spec filter (``deviceId``, ``deviceType``, and the
+        other ``GET /v2/device`` filters) is required so an empty filter set
+        cannot match every device that has the service.
         """
         _require_batch_command(body)
-        data = await async_api(self.auth, "POST", "v2/commands", json_body=dict(body))
+        filters = _batch_filters(params)
+        data = await async_api(self.auth, "POST", "v2/commands", params=filters, json_body=dict(body))
         return SendCommandsSuccessResponse(data, self.auth)
 
     async def async_get_command(
@@ -142,7 +185,7 @@ class SmartHQApi:
 
     async def async_delete_pubsub(self) -> None:
         """Disable account pubsub with ``DELETE /v2/pubsub``."""
-        await async_api(self.auth, "DELETE", "v2/pubsub", ok=(204,))
+        await async_api(self.auth, "DELETE", "v2/pubsub", ok=(204,), expect_object=False)
 
     async def async_get_websocket_endpoint(self) -> WebsocketEndpoint:
         """Return ``GET /v2/websocket``.
@@ -161,3 +204,15 @@ def _require_batch_command(body: dict[str, Any]) -> None:
     command = body.get("command")
     if not isinstance(command, dict) or "commandType" not in command:
         raise SmartHQError("Batch command.command requires commandType")
+
+
+def _batch_filters(params: dict[str, Any] | None) -> dict[str, Any]:
+    filters = {
+        key: value
+        for key, value in (params or {}).items()
+        if key in DEVICE_QUERY_FILTERS and value is not None
+    }
+    if not filters:
+        names = ", ".join(DEVICE_QUERY_FILTERS)
+        raise SmartHQError(f"Batch command requires at least one device filter: {names}")
+    return filters

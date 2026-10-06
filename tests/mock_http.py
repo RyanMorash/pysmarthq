@@ -48,9 +48,14 @@ class MockSession:
 
     async def ws_connect(self, url: str, **kwargs: Any) -> Any:
         self.requests.append({"method": "WS", "url": url, **kwargs})
-        if self.ws is None:
+        socket = self.ws
+        if isinstance(socket, list):
+            if not socket:
+                raise RuntimeError("no websocket scripted")
+            return socket.pop(0)
+        if socket is None:
             raise RuntimeError("no websocket scripted")
-        return self.ws
+        return socket
 
 
 def json_body(request: dict[str, Any]) -> Any:

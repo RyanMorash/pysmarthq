@@ -51,4 +51,21 @@ class SmartHQStreamClosed(SmartHQError):
     The real-time updates guide says SmartHQ closes the socket when the access
     token expires. Get a new token, call ``GET /v2/websocket`` again, reconnect,
     and send the event configuration messages again.
+
+    ``code`` and ``reason`` are the WebSocket close code and reason when the
+    peer sent a close frame. A network drop leaves them unset. Listening with
+    ``async for`` raises this error; it does not end the iterator.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        reason: str | None = None,
+        status: int | None = None,
+        body: Any = None,
+    ) -> None:
+        super().__init__(message, status=status, body=body)
+        self.code = code
+        self.reason = reason
