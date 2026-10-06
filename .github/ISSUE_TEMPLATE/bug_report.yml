@@ -1,0 +1,15 @@
+name: Bug report
+description: A defect in the pysmarthq client, models, or spec mapping
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: What happened
+      description: Include the API operation, the status code, and the relevant payload fields with secrets removed.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: pysmarthq version
+    validations:
+      required: true
