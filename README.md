@@ -10,6 +10,15 @@ The OpenAPI and AsyncAPI documents in [`specs/`](specs/) are the wire contract. 
 
 The package follows the [Home Assistant API library guidance](https://developers.home-assistant.io/docs/api_lib_index): asyncio, aiohttp, no Home Assistant dependency, authentication separated from the API models, and model properties named after the API fields.
 
+## Documentation
+
+The guide and API reference are published on [Read the Docs](https://pysmarthq.readthedocs.io). Import this repository there; [`.readthedocs.yaml`](.readthedocs.yaml) configures the Sphinx build.
+
+```bash
+pip install -e ".[docs]"
+sphinx-build -W -b html docs docs/_build/html
+```
+
 ## Install
 
 ```bash
