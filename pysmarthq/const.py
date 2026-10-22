@@ -18,6 +18,10 @@ REQUEST_TIMEOUT_SECONDS = 30
 # ``GET /v2/device`` allows at most 100 rows per page.
 DEVICE_LIST_PAGE_SIZE = 100
 
+# Stop ``async_get_all_devices`` after this many pages so a huge ``total``
+# cannot be followed forever. 100 pages is 10,000 devices.
+DEVICE_LIST_MAX_PAGES = 100
+
 # Query filters shared by ``GET /v2/device`` and ``POST /v2/commands``.
 DEVICE_QUERY_FILTERS = (
     "deviceId",
@@ -50,3 +54,8 @@ WEBSOCKET_INBOUND_GRACE_INTERVALS = 2
 
 # Real-time updates guide: individual JSON payloads are limited to 32 KB.
 WEBSOCKET_MAX_PAYLOAD_BYTES = 32 * 1024
+
+# Bound events waiting for ``async_receive``. One extra slot is reserved so the
+# terminal error can still be queued when this limit is reached. Protocol
+# PING and PONG frames do not use a slot.
+EVENT_QUEUE_MAX_EVENTS = 1024

@@ -355,6 +355,34 @@ async def test_refresh_without_refresh_token_keeps_the_previous_one(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blank", [None, ""])
+async def test_blank_refresh_token_keeps_the_previous_one(
+    monkeypatch: pytest.MonkeyPatch,
+    blank: object,
+) -> None:
+    monkeypatch.setattr("pysmarthq.auth.time.time", lambda: 1_700_000_000)
+    session = MockSession()
+    session.routes[("POST", "/oauth2/token")] = Response(
+        200,
+        {
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "access_token": "access-2",
+            "refresh_token": blank,
+        },
+    )
+    auth = SmartHQAuth(
+        session,  # type: ignore[arg-type]
+        {"access_token": "access-1", "refresh_token": "refresh-1", "expires_at": 0},
+        client_id="client",
+        client_secret="secret",
+        iam_host="https://iam.example",
+    )
+    assert await auth.async_get_access_token() == "access-2"
+    assert auth.token["refresh_token"] == "refresh-1"
+
+
+@pytest.mark.asyncio
 async def test_missing_and_soon_expiring_tokens_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("pysmarthq.auth.time.time", lambda: 1_700_000_000)
     session = MockSession()
@@ -397,3 +425,33 @@ async def test_missing_and_soon_expiring_tokens_refresh(monkeypatch: pytest.Monk
     )
     assert await current.async_get_access_token() == "access-1"
     assert session.requests == []
+
+    session.requests.clear()
+    boundary = SmartHQAuth(
+        session,  # type: ignore[arg-type]
+        {
+            "access_token": "access-1",
+            "refresh_token": "refresh-1",
+            "expires_at": 1_700_000_000 + 60,
+        },
+        client_id="client",
+        client_secret="secret",
+        iam_host="https://iam.example",
+    )
+    assert await boundary.async_get_access_token() == "access-1"
+    assert session.requests == []
+
+    session.requests.clear()
+    just_under = SmartHQAuth(
+        session,  # type: ignore[arg-type]
+        {
+            "access_token": "access-1",
+            "refresh_token": "refresh-1",
+            "expires_at": 1_700_000_000 + 59,
+        },
+        client_id="client",
+        client_secret="secret",
+        iam_host="https://iam.example",
+    )
+    assert await just_under.async_get_access_token() == "access-2"
+    assert len(session.requests) == 1
