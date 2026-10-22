@@ -116,7 +116,7 @@ Access tokens are bearer tokens for the Digital Twin API. `SmartHQAuth` calls `P
 
 An HTTP 401 refreshes once and retries. A second 401, or a failed refresh, raises `SmartHQAuthError`. HTTP 403 stays `SmartHQApiError`.
 
-`async_get_devices` returns one page. `async_get_all_devices` asks for 100 devices per page and follows `page` until `total` is covered, a short page comes back, or a page repeats device ids already collected. More than 100 pages raises `SmartHQError`. List payloads do not include services; load `GET /v2/device/{deviceId}` before creating entities.
+`async_get_devices` returns one page. `async_get_all_devices` asks for 100 devices per page and follows `page` until `total` is covered, a short page comes back, or every device on a page has an id already collected. The next page is one more than the number of requests, not the `page` field in the response. More than 100 requests raises `SmartHQError`. List payloads do not include services; load `GET /v2/device/{deviceId}` before creating entities.
 
 A single-device command uses the `service#command` body from `POST /v2/command`:
 

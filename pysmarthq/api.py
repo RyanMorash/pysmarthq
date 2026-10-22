@@ -45,10 +45,12 @@ class SmartHQApi:
         """Return every device from ``GET /v2/device``.
 
         Requests ``perpage`` of 100 and follows ``page`` until ``page * perpage``
-        reaches ``total``, a short page comes back, or a page repeats device
-        ids already collected. ``async_get_devices`` still returns one page.
-        More than ``DEVICE_LIST_MAX_PAGES`` pages raises ``SmartHQError``.
-        Other query parameters, including device filters, are sent on every page.
+        reaches ``total``, a short page comes back, or every device on a page
+        has an id already collected. ``async_get_devices`` still returns one
+        page. The page counter is the number of requests made, not the ``page``
+        field in the response. More than ``DEVICE_LIST_MAX_PAGES`` requests
+        raises ``SmartHQError``. Other query parameters, including device
+        filters, are sent on every page.
         """
         filters = {
             key: value
@@ -56,19 +58,20 @@ class SmartHQApi:
             if key not in ("page", "perpage") and value is not None
         }
         page = 1
+        fetched = 0
         devices: list[Device] = []
         seen: set[str] = set()
         while True:
-            if page > DEVICE_LIST_MAX_PAGES:
+            if fetched >= DEVICE_LIST_MAX_PAGES:
                 raise SmartHQError(f"Device list exceeded {DEVICE_LIST_MAX_PAGES} pages")
+            fetched += 1
             listed = await self.async_get_devices(
                 params={**filters, "page": page, "perpage": DEVICE_LIST_PAGE_SIZE}
             )
             batch = listed.devices
-            ids = [device.deviceId for device in batch if device.deviceId]
-            if ids and all(device_id in seen for device_id in ids):
+            if batch and all(_already_seen(device.deviceId, seen) for device in batch):
                 return devices
-            seen.update(ids)
+            seen.update(device.deviceId for device in batch if isinstance(device.deviceId, str) and device.deviceId)
             devices.extend(batch)
             size = listed.perpage if isinstance(listed.perpage, int) and listed.perpage > 0 else DEVICE_LIST_PAGE_SIZE
             current = listed.page if isinstance(listed.page, int) and listed.page > 0 else page
@@ -79,7 +82,7 @@ class SmartHQApi:
                 or (isinstance(total, int) and not isinstance(total, bool) and current * size >= total)
             ):
                 return devices
-            page = current + 1
+            page += 1
 
     async def async_get_device(self, device_id: str) -> Device:
         """Return ``GET /v2/device/{deviceId}``, including services."""
@@ -202,6 +205,10 @@ class SmartHQApi:
         """
         data = await async_api(self.auth, "GET", "v2/websocket")
         return WebsocketEndpoint(data, self.auth)
+
+
+def _already_seen(device_id: str | None, seen: set[str]) -> bool:
+    return isinstance(device_id, str) and bool(device_id) and device_id in seen
 
 
 def _require_batch_command(body: dict[str, Any]) -> None:

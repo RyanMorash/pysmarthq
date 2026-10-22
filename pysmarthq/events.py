@@ -538,8 +538,9 @@ class EventStream:
         """Stop the reader and the idle ping, then close the socket.
 
         The socket is closed even when the ping task has already failed.
-        Task failures are not re-raised here. Stored event configuration is
-        kept for the next ``async_connect``.
+        Failures in those tasks are not re-raised. Cancellation of this call
+        still propagates. Stored event configuration is kept for the next
+        ``async_connect``.
         """
         reader = self._reader
         keepalive = self._keepalive
@@ -550,13 +551,8 @@ class EventStream:
             if not task.done():
                 task.cancel()
         try:
-            for task in tasks:
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    pass
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
         finally:
             try:
                 await self._close_socket()

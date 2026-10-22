@@ -511,3 +511,35 @@ async def test_error_frame_redacts_the_access_token() -> None:
     assert "secret-token" not in str(caught.value)
     assert "REDACTED" in str(caught.value)
     await stream.async_close()
+
+
+@pytest.mark.asyncio
+async def test_closing_the_stream_still_raises_when_the_caller_is_cancelled() -> None:
+    class StickySocket(FakeSocket):
+        def __init__(self) -> None:
+            super().__init__([], block_until_closed=True)
+            self.receive_cancelled = asyncio.Event()
+
+        async def receive(self):
+            try:
+                return await super().receive()
+            except asyncio.CancelledError:
+                self.receive_cancelled.set()
+                await asyncio.sleep(30)
+                raise
+
+    socket = StickySocket()
+    stream = EventStream(_auth(_session(socket)), idle_ping_seconds=None)
+    await stream.async_connect()
+    reader = stream._reader
+    assert reader is not None
+    close_task = asyncio.create_task(stream.async_close())
+    await asyncio.wait_for(socket.receive_cancelled.wait(), timeout=1)
+    close_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+    assert socket.closed
+    done, pending = await asyncio.wait({reader}, timeout=1)
+    assert reader in done
+    assert not pending
+    assert reader.cancelled()

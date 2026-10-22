@@ -393,6 +393,58 @@ async def test_device_list_raises_after_the_page_cap(monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
+async def test_device_list_keeps_a_page_that_includes_an_idless_device() -> None:
+    session = MockSession()
+
+    def devices(method: str, url: str, kwargs: dict) -> Response:
+        page = kwargs["params"]["page"]
+        if page == 1:
+            rows = [{"deviceId": f"d{index}"} for index in range(100)]
+        elif page == 2:
+            rows = [{"deviceId": f"d{index}"} for index in range(98)]
+            rows.append({"deviceId": ""})
+            rows.append({})
+        elif page == 3:
+            rows = []
+        else:
+            raise AssertionError(page)
+        return Response(
+            200,
+            {"kind": "device#list", "page": page, "perpage": 100, "total": 10_000, "devices": rows},
+        )
+
+    session.routes[("GET", "/v2/device")] = devices
+    listed = await SmartHQApi(_auth(session)).async_get_all_devices()
+    assert len(listed) == 200
+    assert listed[-2].deviceId == ""
+    assert listed[-1].deviceId is None
+    assert [item["params"]["page"] for item in session.requests] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_device_list_caps_requests_when_the_response_page_stays_at_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pysmarthq import SmartHQError
+
+    monkeypatch.setattr("pysmarthq.api.DEVICE_LIST_MAX_PAGES", 3)
+    session = MockSession()
+
+    def devices(method: str, url: str, kwargs: dict) -> Response:
+        page = kwargs["params"]["page"]
+        rows = [{"deviceId": f"p{page}-{index}"} for index in range(100)]
+        return Response(
+            200,
+            {"kind": "device#list", "page": 1, "perpage": 100, "total": 10_000, "devices": rows},
+        )
+
+    session.routes[("GET", "/v2/device")] = devices
+    with pytest.raises(SmartHQError, match="3 pages"):
+        await SmartHQApi(_auth(session)).async_get_all_devices()
+    assert [item["params"]["page"] for item in session.requests] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
 async def test_batch_command_requires_a_filter() -> None:
     from pysmarthq import SmartHQError
 
