@@ -54,3 +54,8 @@ WEBSOCKET_INBOUND_GRACE_INTERVALS = 2
 
 # Real-time updates guide: individual JSON payloads are limited to 32 KB.
 WEBSOCKET_MAX_PAYLOAD_BYTES = 32 * 1024
+
+# Bound events waiting for ``async_receive``. One extra slot is reserved so the
+# terminal error can still be queued when this limit is reached. Protocol
+# PING and PONG frames do not use a slot.
+EVENT_QUEUE_MAX_EVENTS = 1024

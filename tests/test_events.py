@@ -543,3 +543,69 @@ async def test_closing_the_stream_still_raises_when_the_caller_is_cancelled() ->
     assert reader in done
     assert not pending
     assert reader.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_blocked_receive_raises_stream_closed_when_the_caller_closes() -> None:
+    socket = FakeSocket([], block_until_closed=True)
+    stream = EventStream(_auth(_session(socket)), idle_ping_seconds=None)
+    await stream.async_connect()
+    pending = asyncio.create_task(stream.async_receive())
+    await asyncio.sleep(0)
+    await stream.async_close()
+    with pytest.raises(SmartHQStreamClosed, match="Event stream closed"):
+        await pending
+
+
+@pytest.mark.asyncio
+async def test_blocked_receive_keeps_its_connection_error_across_reconnect() -> None:
+    first = FakeSocket([], block_until_closed=True)
+    second = FakeSocket([], close_code=1000, close_reason="second-connection")
+    session = _session(first)
+    session.ws = [first, second]
+    stream = EventStream(_auth(session), idle_ping_seconds=None)
+    await stream.async_connect()
+    pending = asyncio.create_task(stream.async_receive())
+    await asyncio.sleep(0)
+    await stream.async_connect()
+    with pytest.raises(SmartHQStreamClosed, match="Event stream closed") as caught:
+        await pending
+    assert "second-connection" not in str(caught.value)
+    assert first.closed
+    with pytest.raises(SmartHQStreamClosed, match="second-connection"):
+        await stream.async_receive()
+    await stream.async_close()
+
+
+@pytest.mark.asyncio
+async def test_event_queue_overflow_fails_the_stream_and_still_answers_ping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("pysmarthq.events.EVENT_QUEUE_MAX_EVENTS", 2)
+    socket = FakeSocket([], block_until_closed=True)
+    for device_id in ("device-1", "device-2"):
+        socket.push(
+            _frame(
+                WSMsgType.TEXT,
+                json.dumps({"kind": "pubsub#presence", "deviceId": device_id, "presence": "ONLINE"}),
+            )
+        )
+    socket.push(_frame(WSMsgType.PING, b"hi"))
+    socket.push(
+        _frame(
+            WSMsgType.TEXT,
+            json.dumps({"kind": "pubsub#presence", "deviceId": "device-3", "presence": "ONLINE"}),
+        )
+    )
+    stream = EventStream(_auth(_session(socket)), idle_ping_seconds=None)
+    await stream.async_connect()
+    await asyncio.sleep(0)
+    first = await stream.async_receive()
+    second = await stream.async_receive()
+    assert first.deviceId == "device-1"
+    assert second.deviceId == "device-2"
+    with pytest.raises(SmartHQStreamClosed, match="2 events"):
+        await stream.async_receive()
+    assert socket.pongs == [b"hi"]
+    assert socket.closed
+    await stream.async_close()

@@ -26,6 +26,7 @@ from aiohttp import ClientWSTimeout, WSMsgType
 from .auth import AbstractAuth
 from ._http import async_api, redact_access_token
 from .const import (
+    EVENT_QUEUE_MAX_EVENTS,
     REQUEST_TIMEOUT_SECONDS,
     WEBSOCKET_IDLE_PING_SECONDS,
     WEBSOCKET_INBOUND_GRACE_INTERVALS,
@@ -358,6 +359,51 @@ def parse_event(payload: dict[str, Any]) -> Event:
 _QUEUE_CLOSED = object()
 
 
+class _ConnectionQueue:
+    """Events and the terminal error for one WebSocket connection.
+
+    The queue holds at most ``EVENT_QUEUE_MAX_EVENTS`` events. The extra slot
+    is only for the closed marker, so a full buffer can still wake a receiver.
+    ``error`` stays on this object when the stream opens another connection.
+    """
+
+    def __init__(self) -> None:
+        self._items: asyncio.Queue[Any] = asyncio.Queue(maxsize=EVENT_QUEUE_MAX_EVENTS + 1)
+        self.error: Exception | None = None
+
+    def put_event(self, event: Event) -> bool:
+        """Queue one event. Return false when the buffer is full or already closed."""
+        if self.error is not None or self._items.qsize() >= EVENT_QUEUE_MAX_EVENTS:
+            return False
+        try:
+            self._items.put_nowait(event)
+        except asyncio.QueueFull:
+            return False
+        return True
+
+    def fail(self, error: Exception) -> None:
+        """Record the first terminal error and wake every waiting receiver."""
+        if self.error is None:
+            self.error = error
+        self._wake()
+
+    def _wake(self) -> None:
+        try:
+            self._items.put_nowait(_QUEUE_CLOSED)
+        except asyncio.QueueFull:
+            try:
+                self._items.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                self._items.put_nowait(_QUEUE_CLOSED)
+            except asyncio.QueueFull:
+                return
+
+    async def get(self) -> Any:
+        return await self._items.get()
+
+
 class EventStream:
     """WebSocket event stream for one SmartHQ user.
 
@@ -391,7 +437,7 @@ class EventStream:
         self._account_config: dict[str, Any] | None = None
         self._device_configs: dict[str, dict[str, Any]] = {}
         self._ws: Any = None
-        self._queue: asyncio.Queue[Any] | None = None
+        self._queue: _ConnectionQueue | None = None
         self._reader: asyncio.Task[None] | None = None
         self._keepalive: asyncio.Task[None] | None = None
         self._send_lock = asyncio.Lock()
@@ -431,7 +477,7 @@ class EventStream:
             raise
         except Exception as err:
             raise SmartHQError(redact_access_token(str(err))) from None
-        self._queue = asyncio.Queue()
+        self._queue = _ConnectionQueue()
         self._ws = socket
         self.endpoint = endpoint
         self.socket_expires_at = expires_at
@@ -508,11 +554,12 @@ class EventStream:
         """Read the next event message.
 
         Events already queued by the reader are returned before a close error.
-        A protocol PONG counts as inbound and is not returned. A protocol PING
-        is answered and does not count as inbound. A ``websocket#pong`` text
-        frame is returned as ``PongEvent``. A closed socket raises
-        ``SmartHQStreamClosed`` with the close code and reason when the peer
-        sent them.
+        The error belongs to the connection that queued it. A protocol PONG
+        counts as inbound and is not returned. A protocol PING is answered and
+        does not count as inbound. A ``websocket#pong`` text frame is returned
+        as ``PongEvent``. A closed socket raises ``SmartHQStreamClosed`` with
+        the close code and reason when the peer sent them. ``async_close``
+        raises ``SmartHQStreamClosed`` as well.
         """
         queue = self._queue
         if queue is None:
@@ -521,8 +568,8 @@ class EventStream:
             raise SmartHQError("Event stream is not connected")
         item = await queue.get()
         if item is _QUEUE_CLOSED:
-            error = self._receive_error
-            queue.put_nowait(_QUEUE_CLOSED)
+            error = queue.error
+            queue._wake()
             if error is not None:
                 raise error
             raise SmartHQError("Event stream is not connected")
@@ -539,8 +586,9 @@ class EventStream:
 
         The socket is closed even when the ping task has already failed.
         Failures in those tasks are not re-raised. Cancellation of this call
-        still propagates. Stored event configuration is kept for the next
-        ``async_connect``.
+        still propagates. A receiver waiting on this connection raises
+        ``SmartHQStreamClosed``. Stored event configuration is kept for the
+        next ``async_connect``.
         """
         reader = self._reader
         keepalive = self._keepalive
@@ -560,7 +608,12 @@ class EventStream:
                 queue = self._queue
                 self._queue = None
                 if queue is not None:
-                    queue.put_nowait(_QUEUE_CLOSED)
+                    error = queue.error or self._receive_error
+                    if error is None:
+                        error = SmartHQStreamClosed("Event stream closed")
+                        self._receive_error = error
+                        self._closed_error = error
+                    queue.fail(error)
 
     async def __aenter__(self) -> EventStream:
         await self.async_connect()
@@ -615,9 +668,13 @@ class EventStream:
                 await self._fail(SmartHQError("Event message was not a JSON object"))
                 return False
             queue = self._queue
-            if queue is None:
+            if queue is None or queue.error is not None:
                 return False
-            queue.put_nowait(parse_event(payload))
+            if not queue.put_event(parse_event(payload)):
+                await self._fail(
+                    SmartHQStreamClosed(f"Event queue exceeded {EVENT_QUEUE_MAX_EVENTS} events")
+                )
+                return False
             return True
         if kind == WSMsgType.BINARY:
             await self._fail(SmartHQError("Unexpected binary WebSocket frame"))
@@ -704,7 +761,7 @@ class EventStream:
             self._closed_error = error
         queue = self._queue
         if queue is not None:
-            queue.put_nowait(_QUEUE_CLOSED)
+            queue.fail(error)
         await self._close_socket()
 
     async def _close_socket(self) -> None:
