@@ -198,6 +198,22 @@ class AbstractAuth(ABC):
     async def async_get_access_token(self) -> str:
         """Return a valid access token."""
 
+    def token_expires_at(self) -> float | None:
+        """Return the access token expiry as a Unix timestamp, when known.
+
+        ``SmartHQAuth`` reads ``token["expires_at"]``. A Home Assistant auth
+        object that keeps the token elsewhere can override this so
+        ``EventStream.socket_expires_at`` can be scheduled. ``None`` means this
+        object does not know the expiry.
+        """
+        token = getattr(self, "token", None)
+        if not isinstance(token, Mapping):
+            return None
+        expires_at = token.get("expires_at")
+        if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+            return None
+        return float(expires_at)
+
     async def async_force_refresh(self) -> None:
         """Refresh after the server rejected the access token.
 
@@ -289,7 +305,9 @@ class SmartHQAuth(AbstractAuth):
                 host=self._iam_host,
                 timeout=self.timeout,
             )
-            if "refresh_token" not in refreshed:
+            # A missing, null, or blank refresh token leaves the previous one in place.
+            new_refresh = refreshed.get("refresh_token")
+            if not isinstance(new_refresh, str) or not new_refresh:
                 refreshed["refresh_token"] = refresh_token
             self.token = refreshed
             await self._persist_token()
@@ -409,4 +427,4 @@ def _token_is_current(token: Mapping[str, Any]) -> bool:
     expires_at = token.get("expires_at")
     if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
         return False
-    return time.time() < float(expires_at) - ACCESS_TOKEN_REFRESH_LEEWAY_SECONDS
+    return time.time() <= float(expires_at) - ACCESS_TOKEN_REFRESH_LEEWAY_SECONDS

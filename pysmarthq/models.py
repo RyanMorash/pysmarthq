@@ -223,11 +223,16 @@ class Device(ApiModel):
         ``pubsub#device`` copies ``config`` and ``supportedCommands`` from the
         embedded services and does not clear ``state`` when the event omits it.
         ``created`` and ``removed`` are device-registry events; this object
-        does not add or remove itself.
+        does not add or remove itself. A payload whose ``deviceId`` differs
+        from this device is ignored. A payload that omits ``deviceId`` is
+        still applied.
         """
         payload = getattr(event, "raw_data", event)
         if not isinstance(payload, dict):
             raise SmartHQError("Event payload was not an object")
+        event_device = payload.get("deviceId")
+        if isinstance(event_device, str) and event_device and self.deviceId and event_device != self.deviceId:
+            return
         kind = payload.get("kind")
         if kind == "pubsub#service":
             _copy_service_fields(self, payload, _SERVICE_EVENT_FIELDS)
