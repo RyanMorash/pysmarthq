@@ -352,6 +352,47 @@ async def test_device_list_follows_pages_of_100() -> None:
 
 
 @pytest.mark.asyncio
+async def test_device_list_stops_when_a_page_repeats_ids() -> None:
+    session = MockSession()
+
+    def devices(method: str, url: str, kwargs: dict) -> Response:
+        page = kwargs["params"]["page"]
+        if page > 2:
+            raise AssertionError(page)
+        rows = [{"deviceId": f"d{index}"} for index in range(100)]
+        return Response(
+            200,
+            {"kind": "device#list", "page": page, "perpage": 100, "total": 10_000, "devices": rows},
+        )
+
+    session.routes[("GET", "/v2/device")] = devices
+    listed = await SmartHQApi(_auth(session)).async_get_all_devices()
+    assert [device.deviceId for device in listed] == [f"d{index}" for index in range(100)]
+    assert [item["params"]["page"] for item in session.requests] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_device_list_raises_after_the_page_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pysmarthq import SmartHQError
+
+    monkeypatch.setattr("pysmarthq.api.DEVICE_LIST_MAX_PAGES", 2)
+    session = MockSession()
+
+    def devices(method: str, url: str, kwargs: dict) -> Response:
+        page = kwargs["params"]["page"]
+        rows = [{"deviceId": f"p{page}-{index}"} for index in range(100)]
+        return Response(
+            200,
+            {"kind": "device#list", "page": page, "perpage": 100, "total": 10_000, "devices": rows},
+        )
+
+    session.routes[("GET", "/v2/device")] = devices
+    with pytest.raises(SmartHQError, match="2 pages"):
+        await SmartHQApi(_auth(session)).async_get_all_devices()
+    assert [item["params"]["page"] for item in session.requests] == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_batch_command_requires_a_filter() -> None:
     from pysmarthq import SmartHQError
 
@@ -557,6 +598,15 @@ async def test_apply_event_updates_services_without_wiping_state() -> None:
 
     device.apply_event(
         {
+            "kind": "pubsub#presence",
+            "deviceId": "other-device",
+            "presence": "ONLINE",
+        }
+    )
+    assert device.presence == "OFFLINE"
+
+    device.apply_event(
+        {
             "kind": "pubsub#service",
             "serviceId": "power",
             "state": {"on": True},
@@ -569,6 +619,7 @@ async def test_apply_event_updates_services_without_wiping_state() -> None:
     device.apply_event(
         {
             "kind": "pubsub#presence",
+            "deviceId": "device-1",
             "presence": "ONLINE",
             "lastSyncTime": "2024-01-01T00:00:01.000Z",
         }

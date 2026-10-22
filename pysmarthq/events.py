@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Mapping
 from typing import Any
 
 from aiohttp import ClientWSTimeout, WSMsgType
@@ -356,13 +355,18 @@ def parse_event(payload: dict[str, Any]) -> Event:
     return _EVENT_TYPES.get(kind, Event)(payload)
 
 
+_QUEUE_CLOSED = object()
+
+
 class EventStream:
     """WebSocket event stream for one SmartHQ user.
 
     The caller owns the aiohttp session on ``auth``. This client fetches a new
     endpoint on each ``async_connect`` and does not reconnect on its own.
-    Home Assistant should schedule that from ``socket_expires_at``: the socket
-    is tied to the access token in its URL and still closes at that expiry.
+    ``socket_expires_at`` is ``auth.token_expires_at()`` at the moment
+    ``GET /v2/websocket`` returns, before the handshake. Schedule the next
+    connect from it when it is set. A background reader is the only caller of
+    ``receive``, so the idle-ping grace period sees frames as they arrive.
     ``async_connect`` closes any current socket and sends the last account and
     device configuration messages again.
     """
@@ -387,9 +391,13 @@ class EventStream:
         self._account_config: dict[str, Any] | None = None
         self._device_configs: dict[str, dict[str, Any]] = {}
         self._ws: Any = None
+        self._queue: asyncio.Queue[Any] | None = None
+        self._reader: asyncio.Task[None] | None = None
         self._keepalive: asyncio.Task[None] | None = None
+        self._send_lock = asyncio.Lock()
         self._last_activity = 0.0
         self._last_inbound = 0.0
+        self._receive_error: Exception | None = None
         self._closed_error: SmartHQStreamClosed | None = None
 
     async def async_connect(self) -> WebsocketEndpoint:
@@ -397,35 +405,47 @@ class EventStream:
 
         Closes the current socket first. After the handshake, sends the last
         account configuration and the last configuration for each device again.
-        The connect acknowledgement is not consumed. Read it with
-        ``async_receive``. ``socket_expires_at`` is the token expiry baked into
-        this URL.
+        The connect acknowledgement is not consumed here. Read it with
+        ``async_receive``. ``socket_expires_at`` is sampled before the
+        handshake from ``auth.token_expires_at()``. A failed connect leaves
+        this stream disconnected.
         """
         await self.async_close()
         self.endpoint = None
         self.socket_expires_at = None
+        self._receive_error = None
+        self._closed_error = None
         data = await async_api(self.auth, "GET", "v2/websocket")
         endpoint = WebsocketEndpoint(data, self.auth)
         if not endpoint.endpoint:
             raise SmartHQError("GET /v2/websocket did not include endpoint", body=data)
+        expires_at = self.auth.token_expires_at()
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
                 socket = await self.auth.websession.ws_connect(
                     endpoint.endpoint,
+                    autoping=False,
                     timeout=ClientWSTimeout(ws_close=float(REQUEST_TIMEOUT_SECONDS)),
                 )
         except asyncio.CancelledError:
             raise
         except Exception as err:
             raise SmartHQError(redact_access_token(str(err))) from None
+        self._queue = asyncio.Queue()
         self._ws = socket
         self.endpoint = endpoint
-        self.socket_expires_at = _token_expires_at(self.auth)
-        self._closed_error = None
+        self.socket_expires_at = expires_at
         self._note_inbound()
+        self._reader = asyncio.create_task(self._reader_loop())
         if self.idle_ping_seconds:
             self._keepalive = asyncio.create_task(self._keepalive_loop())
-        await self._replay_configuration()
+        try:
+            await self._replay_configuration()
+        except BaseException:
+            await self.async_close()
+            self.endpoint = None
+            self.socket_expires_at = None
+            raise
         return endpoint
 
     async def async_configure_account(
@@ -440,7 +460,8 @@ class EventStream:
         """Send an account-level WebSocket configuration message.
 
         ``kind`` is ``websocket#pubsub`` and ``action`` is ``pubsub``. Optional
-        flags that are left as ``None`` are omitted.
+        flags that are left as ``None`` are omitted. The stored replay payload
+        changes only after the send completes.
         """
         payload: dict[str, Any] = {
             "kind": "websocket#pubsub",
@@ -448,8 +469,8 @@ class EventStream:
             "pubsub": pubsub,
         }
         _put_optional(payload, services=services, presence=presence, alerts=alerts, commands=commands)
-        self._account_config = dict(payload)
         await self._send(payload)
+        self._account_config = dict(payload)
 
     async def async_configure_device(
         self,
@@ -464,7 +485,8 @@ class EventStream:
 
         Account pubsub must already be enabled. This payload has no ``pubsub``
         field; that field belongs to the account configuration and to the
-        Digital Twin device pubsub body.
+        Digital Twin device pubsub body. The stored replay payload changes
+        only after the send completes.
         """
         payload: dict[str, Any] = {
             "kind": "websocket#pubsub",
@@ -472,8 +494,8 @@ class EventStream:
             "deviceId": device_id,
         }
         _put_optional(payload, services=services, presence=presence, alerts=alerts, commands=commands)
-        self._device_configs[device_id] = dict(payload)
         await self._send(payload)
+        self._device_configs[device_id] = dict(payload)
 
     async def async_ping(self, id: str | None = None) -> None:
         """Send ``websocket#ping``. ``id`` is copied onto the pong when set."""
@@ -485,37 +507,26 @@ class EventStream:
     async def async_receive(self) -> Event:
         """Read the next event message.
 
-        Protocol-level ping frames are ignored. A pong or an event counts as
-        inbound traffic. A closed socket raises ``SmartHQStreamClosed`` with
-        the close code and reason when the peer sent them.
+        Events already queued by the reader are returned before a close error.
+        A protocol PONG counts as inbound and is not returned. A protocol PING
+        is answered and does not count as inbound. A ``websocket#pong`` text
+        frame is returned as ``PongEvent``. A closed socket raises
+        ``SmartHQStreamClosed`` with the close code and reason when the peer
+        sent them.
         """
-        if self._closed_error is not None:
-            raise self._closed_error
-        ws = self._require_ws()
-        while True:
-            message = await ws.receive()
-            if self._closed_error is not None:
-                raise self._closed_error
-            kind = message.type
-            if kind == WSMsgType.PONG:
-                self._note_inbound()
-                continue
-            if kind == WSMsgType.PING:
-                continue
-            if kind == WSMsgType.TEXT:
-                self._note_inbound()
-                try:
-                    payload = json.loads(message.data)
-                except json.JSONDecodeError as err:
-                    raise SmartHQError("Event message was not JSON") from err
-                if not isinstance(payload, dict):
-                    raise SmartHQError("Event message was not a JSON object")
-                return parse_event(payload)
-            if kind == WSMsgType.BINARY:
-                raise SmartHQError("Unexpected binary WebSocket frame")
-            if kind in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
-                raise _stream_closed(message)
-            raise SmartHQError(f"Unsupported WebSocket frame type {kind}")
+        queue = self._queue
+        if queue is None:
+            if self._receive_error is not None:
+                raise self._receive_error
+            raise SmartHQError("Event stream is not connected")
+        item = await queue.get()
+        if item is _QUEUE_CLOSED:
+            error = self._receive_error
+            queue.put_nowait(_QUEUE_CLOSED)
+            if error is not None:
+                raise error
+            raise SmartHQError("Event stream is not connected")
+        return item
 
     def __aiter__(self) -> EventStream:
         return self
@@ -524,22 +535,36 @@ class EventStream:
         return await self.async_receive()
 
     async def async_close(self) -> None:
-        """Stop the idle ping and close the socket.
+        """Stop the reader and the idle ping, then close the socket.
 
         The socket is closed even when the ping task has already failed.
-        Stored event configuration is kept for the next ``async_connect``.
+        Task failures are not re-raised here. Stored event configuration is
+        kept for the next ``async_connect``.
         """
-        task = self._keepalive
+        reader = self._reader
+        keepalive = self._keepalive
+        self._reader = None
         self._keepalive = None
-        try:
-            if task is not None:
+        tasks = [task for task in (reader, keepalive) if task is not None]
+        for task in tasks:
+            if not task.done():
                 task.cancel()
+        try:
+            for task in tasks:
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
+                except Exception:
+                    pass
         finally:
-            await self._close_socket()
+            try:
+                await self._close_socket()
+            finally:
+                queue = self._queue
+                self._queue = None
+                if queue is not None:
+                    queue.put_nowait(_QUEUE_CLOSED)
 
     async def __aenter__(self) -> EventStream:
         await self.async_connect()
@@ -554,34 +579,137 @@ class EventStream:
         for payload in self._device_configs.values():
             await self._send(dict(payload))
 
+    async def _reader_loop(self) -> None:
+        try:
+            while self._ws is not None and self._receive_error is None:
+                ws = self._ws
+                if ws is None:
+                    return
+                message = await ws.receive()
+                if self._receive_error is not None or self._ws is None:
+                    return
+                if not await self._handle_frame(message):
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            if self._receive_error is None:
+                await self._fail(
+                    SmartHQStreamClosed(redact_access_token(f"WebSocket connection failed: {err}"))
+                )
+
+    async def _handle_frame(self, message: Any) -> bool:
+        """Queue one frame. Return false when the reader should stop."""
+        kind = message.type
+        if kind == WSMsgType.PONG:
+            self._note_inbound()
+            return True
+        if kind == WSMsgType.PING:
+            data = message.data if isinstance(message.data, (bytes, bytearray)) else b""
+            await self._send_pong(bytes(data))
+            return self._receive_error is None
+        if kind == WSMsgType.TEXT:
+            self._note_inbound()
+            try:
+                payload = json.loads(message.data)
+            except json.JSONDecodeError:
+                await self._fail(SmartHQError("Event message was not JSON"))
+                return False
+            if not isinstance(payload, dict):
+                await self._fail(SmartHQError("Event message was not a JSON object"))
+                return False
+            queue = self._queue
+            if queue is None:
+                return False
+            queue.put_nowait(parse_event(payload))
+            return True
+        if kind == WSMsgType.BINARY:
+            await self._fail(SmartHQError("Unexpected binary WebSocket frame"))
+            return False
+        if kind in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
+            await self._fail(_stream_closed(message))
+            return False
+        await self._fail(SmartHQError(f"Unsupported WebSocket frame type {kind}"))
+        return False
+
     async def _send(self, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload).encode()
         if len(encoded) > WEBSOCKET_MAX_PAYLOAD_BYTES:
             raise SmartHQError("WebSocket payload exceeds 32 KB")
-        await self._require_ws().send_str(encoded.decode())
+        async with self._send_lock:
+            ws = self._require_ws()
+            try:
+                await ws.send_str(encoded.decode())
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                send_error: Exception | None = err
+            else:
+                send_error = None
+        if send_error is not None:
+            await self._fail(SmartHQStreamClosed(redact_access_token(f"WebSocket send failed: {send_error}")))
+            raise send_error
         self._note_outbound()
+
+    async def _send_pong(self, data: bytes) -> None:
+        async with self._send_lock:
+            ws = self._ws
+            if ws is None:
+                return
+            try:
+                await ws.pong(data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                pong_error: Exception | None = err
+            else:
+                pong_error = None
+        if pong_error is not None:
+            await self._fail(SmartHQStreamClosed(redact_access_token(f"WebSocket send failed: {pong_error}")))
 
     async def _keepalive_loop(self) -> None:
         interval = self.idle_ping_seconds
         if not interval:
             return
         try:
-            while True:
+            while self._ws is not None and self._receive_error is None:
                 await asyncio.sleep(interval)
-                if self._ws is None:
+                if self._ws is None or self._receive_error is not None:
                     return
-                if time.monotonic() - self._last_activity >= interval:
-                    await self.async_ping()
-                if self._ws is None:
+                try:
+                    if time.monotonic() - self._last_activity >= interval:
+                        await self.async_ping()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as err:
+                    if self._receive_error is None:
+                        await self._fail(
+                            SmartHQStreamClosed(redact_access_token(f"WebSocket send failed: {err}"))
+                        )
+                    return
+                if self._ws is None or self._receive_error is not None:
                     return
                 if time.monotonic() - self._last_inbound >= interval * WEBSOCKET_INBOUND_GRACE_INTERVALS:
-                    self._closed_error = SmartHQStreamClosed(
-                        "No inbound WebSocket frame within the grace period"
-                    )
-                    await self._close_socket()
+                    await self._fail(SmartHQStreamClosed("No inbound WebSocket frame within the grace period"))
                     return
         except asyncio.CancelledError:
             raise
+
+    async def _fail(self, error: Exception) -> None:
+        """Record a terminal error, wake receivers, and close the socket.
+
+        Call this only after ``receive`` has returned. ``close`` waits for an
+        in-flight ``receive`` on the same task.
+        """
+        if self._receive_error is not None:
+            return
+        self._receive_error = error
+        if isinstance(error, SmartHQStreamClosed):
+            self._closed_error = error
+        queue = self._queue
+        if queue is not None:
+            queue.put_nowait(_QUEUE_CLOSED)
+        await self._close_socket()
 
     async def _close_socket(self) -> None:
         ws = self._ws
@@ -603,25 +731,17 @@ class EventStream:
         return self._ws
 
 
-def _token_expires_at(auth: AbstractAuth) -> float | None:
-    token = getattr(auth, "token", None)
-    if not isinstance(token, Mapping):
-        return None
-    expires_at = token.get("expires_at")
-    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
-        return None
-    return float(expires_at)
-
-
 def _stream_closed(message: Any) -> SmartHQStreamClosed:
     data = getattr(message, "data", None)
     extra = getattr(message, "extra", None)
     if getattr(message, "type", None) == WSMsgType.ERROR:
         detail = data if data else extra
         text = "WebSocket connection failed" if not detail else f"WebSocket connection failed: {detail}"
-        return SmartHQStreamClosed(text)
+        return SmartHQStreamClosed(redact_access_token(text))
     code = data if isinstance(data, int) and not isinstance(data, bool) else None
     reason = extra if isinstance(extra, str) and extra else None
+    if isinstance(reason, str):
+        reason = redact_access_token(reason)
     if code is None and reason is None:
         return SmartHQStreamClosed("WebSocket connection closed")
     parts = ["WebSocket connection closed"]
@@ -629,7 +749,7 @@ def _stream_closed(message: Any) -> SmartHQStreamClosed:
         parts.append(f"code {code}")
     if reason:
         parts.append(reason)
-    return SmartHQStreamClosed(" ".join(parts), code=code, reason=reason)
+    return SmartHQStreamClosed(redact_access_token(" ".join(parts)), code=code, reason=reason)
 
 
 def _put_optional(payload: dict[str, Any], **flags: bool | None) -> None:

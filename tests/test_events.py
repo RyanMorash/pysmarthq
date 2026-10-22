@@ -14,6 +14,10 @@ from pysmarthq.events import AlertEvent, ConnectionEvent, PresenceEvent, PubsubA
 from tests.mock_http import MockSession, Response
 
 
+def _frame(kind: WSMsgType, data: object = None, extra: object = None) -> object:
+    return type("Frame", (), {"type": kind, "data": data, "extra": extra})()
+
+
 class FakeSocket:
     def __init__(
         self,
@@ -23,29 +27,49 @@ class FakeSocket:
         close_reason: str | None = None,
         block_until_closed: bool = False,
     ) -> None:
-        self.incoming = [
-            type("Frame", (), {"type": WSMsgType.TEXT, "data": json.dumps(item)})() for item in incoming
-        ]
+        self._frames: asyncio.Queue[object] = asyncio.Queue()
+        for item in incoming:
+            self._frames.put_nowait(_frame(WSMsgType.TEXT, json.dumps(item)))
         self.sent: list[str] = []
+        self.pongs: list[bytes] = []
         self.closed = False
         self.close_code = close_code
         self.close_reason = close_reason
         self.block_until_closed = block_until_closed
         self._closed_event = asyncio.Event()
 
+    def push(self, frame: object) -> None:
+        self._frames.put_nowait(frame)
+
     async def send_str(self, data: str) -> None:
         self.sent.append(data)
 
+    async def pong(self, data: bytes = b"") -> None:
+        self.pongs.append(data)
+
+    def _close_frame(self) -> object:
+        return _frame(WSMsgType.CLOSE, self.close_code, self.close_reason)
+
     async def receive(self):
-        if self.incoming:
-            return self.incoming.pop(0)
-        if self.block_until_closed:
-            await self._closed_event.wait()
-        return type(
-            "Frame",
-            (),
-            {"type": WSMsgType.CLOSE, "data": self.close_code, "extra": self.close_reason},
-        )()
+        if not self._frames.empty():
+            return self._frames.get_nowait()
+        if not self.block_until_closed:
+            return self._close_frame()
+        get_task = asyncio.create_task(self._frames.get())
+        close_task = asyncio.create_task(self._closed_event.wait())
+        try:
+            done, pending = await asyncio.wait({get_task, close_task}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            get_task.cancel()
+            close_task.cancel()
+            raise
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        if get_task in done:
+            return get_task.result()
+        return self._close_frame()
 
     async def close(self) -> None:
         self.closed = True
@@ -106,6 +130,7 @@ async def test_connect_uses_the_endpoint_url_and_parses_events() -> None:
     connect_call = session.requests[-1]
     assert connect_call["method"] == "WS"
     assert connect_call["url"] == endpoint.endpoint
+    assert connect_call["autoping"] is False
     assert "headers" not in connect_call
 
     connected = await stream.async_receive()
@@ -124,7 +149,7 @@ async def test_connect_uses_the_endpoint_url_and_parses_events() -> None:
 
 @pytest.mark.asyncio
 async def test_configuration_messages_match_the_asyncapi_fields() -> None:
-    socket = FakeSocket([{"kind": "websocket#pubsub", "success": True}])
+    socket = FakeSocket([{"kind": "websocket#pubsub", "success": True}], block_until_closed=True)
     stream = EventStream(_auth(_session(socket)), idle_ping_seconds=None)
     await stream.async_connect()
     await stream.async_configure_account(pubsub=True, services=True, presence=False, alerts=True, commands=True)
@@ -205,7 +230,7 @@ async def test_websocket_http_error_does_not_open_a_socket() -> None:
 
 @pytest.mark.asyncio
 async def test_idle_ping_follows_quiet_time() -> None:
-    socket = FakeSocket([])
+    socket = FakeSocket([], block_until_closed=True)
     stream = EventStream(_auth(_session(socket)), idle_ping_seconds=0.05)
     await stream.async_connect()
     await asyncio.sleep(0.18)
@@ -238,8 +263,8 @@ async def test_async_for_raises_stream_closed_with_the_close_code() -> None:
 
 @pytest.mark.asyncio
 async def test_second_connect_closes_the_first_socket_and_replays_config() -> None:
-    first = FakeSocket([])
-    second = FakeSocket([])
+    first = FakeSocket([], block_until_closed=True)
+    second = FakeSocket([], block_until_closed=True)
     session = _session(first)
     session.ws = [first, second]
     stream = EventStream(_auth(session), idle_ping_seconds=None)
@@ -263,18 +288,13 @@ async def test_ping_task_failure_still_closes_the_socket() -> None:
         async def send_str(self, data: str) -> None:
             raise RuntimeError("send failed")
 
-    socket = BoomSocket([])
+    socket = BoomSocket([], block_until_closed=True)
     stream = EventStream(_auth(_session(socket)), idle_ping_seconds=0.05)
     await stream.async_connect()
-    task = stream._keepalive
-    assert task is not None
-    for _ in range(50):
-        if task.done():
-            break
-        await asyncio.sleep(0.02)
-    assert task.done()
-    with pytest.raises(RuntimeError, match="send failed"):
-        await stream.async_close()
+    with pytest.raises(SmartHQStreamClosed, match="send failed"):
+        await asyncio.wait_for(stream.async_receive(), timeout=1)
+    assert socket.closed
+    await stream.async_close()
     assert socket.closed
 
 
@@ -321,3 +341,173 @@ async def test_connect_failure_redacts_the_access_token() -> None:
     )
     assert "secret-token" not in repr(shown)
     assert "REDACTED" in repr(shown)
+
+
+@pytest.mark.asyncio
+async def test_queued_text_is_delivered_before_the_grace_close() -> None:
+    socket = FakeSocket(
+        [{"kind": "pubsub#presence", "deviceId": "device-1", "presence": "ONLINE"}],
+        block_until_closed=True,
+    )
+    stream = EventStream(_auth(_session(socket)), idle_ping_seconds=0.05)
+    await stream.async_connect()
+    event = await stream.async_receive()
+    assert event.kind == "pubsub#presence"
+    with pytest.raises(SmartHQStreamClosed, match="inbound"):
+        await asyncio.wait_for(stream.async_receive(), timeout=1)
+    await stream.async_close()
+
+
+@pytest.mark.asyncio
+async def test_protocol_pong_resets_the_inbound_timer() -> None:
+    socket = FakeSocket([], block_until_closed=True)
+    stream = EventStream(_auth(_session(socket)), idle_ping_seconds=0.05)
+    await stream.async_connect()
+    for _ in range(4):
+        await asyncio.sleep(0.06)
+        socket.push(_frame(WSMsgType.PONG, b""))
+    await asyncio.sleep(0.06)
+    assert stream._receive_error is None
+    assert socket.closed is False
+    await stream.async_close()
+
+
+@pytest.mark.asyncio
+async def test_protocol_ping_is_answered_and_does_not_count_as_inbound() -> None:
+    socket = FakeSocket([], block_until_closed=True)
+    stream = EventStream(_auth(_session(socket)), idle_ping_seconds=0.05)
+    await stream.async_connect()
+    socket.push(_frame(WSMsgType.PING, b"hi"))
+    await asyncio.sleep(0.02)
+    assert socket.pongs == [b"hi"]
+    with pytest.raises(SmartHQStreamClosed, match="inbound"):
+        await asyncio.wait_for(stream.async_receive(), timeout=1)
+    await stream.async_close()
+
+
+@pytest.mark.asyncio
+async def test_sends_are_serialized() -> None:
+    class SlowSocket(FakeSocket):
+        def __init__(self) -> None:
+            super().__init__([], block_until_closed=True)
+            self.active = 0
+            self.max_active = 0
+
+        async def send_str(self, data: str) -> None:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0.02)
+            self.sent.append(data)
+            self.active -= 1
+
+    socket = SlowSocket()
+    stream = EventStream(_auth(_session(socket)), idle_ping_seconds=None)
+    await stream.async_connect()
+    await asyncio.gather(stream.async_ping(id="a"), stream.async_ping(id="b"))
+    assert socket.max_active == 1
+    assert len(socket.sent) == 2
+    await stream.async_close()
+
+
+@pytest.mark.asyncio
+async def test_failed_send_keeps_the_previous_configuration() -> None:
+    class FailSecond(FakeSocket):
+        async def send_str(self, data: str) -> None:
+            self.sent.append(data)
+            if len(self.sent) >= 2:
+                raise RuntimeError("nope")
+
+    first = FailSecond([], block_until_closed=True)
+    second = FakeSocket([], block_until_closed=True)
+    session = _session(first)
+    session.ws = [first, second]
+    stream = EventStream(_auth(session), idle_ping_seconds=None)
+    await stream.async_connect()
+    await stream.async_configure_account(pubsub=True, services=True)
+    with pytest.raises(RuntimeError, match="nope"):
+        await stream.async_configure_account(pubsub=False)
+    assert stream._account_config is not None
+    assert stream._account_config["pubsub"] is True
+    await stream.async_connect()
+    assert stream._ws is second
+    sent = [json.loads(item) for item in second.sent]
+    assert sent[0]["pubsub"] is True
+    assert sent[0]["services"] is True
+    await stream.async_close()
+
+
+@pytest.mark.asyncio
+async def test_replay_failure_leaves_the_stream_disconnected() -> None:
+    class BoomSocket(FakeSocket):
+        async def send_str(self, data: str) -> None:
+            raise RuntimeError("replay failed")
+
+    first = FakeSocket([], block_until_closed=True)
+    second = BoomSocket([], block_until_closed=True)
+    session = _session(first)
+    session.ws = [first, second]
+    stream = EventStream(_auth(session), idle_ping_seconds=None)
+    await stream.async_connect()
+    await stream.async_configure_account(pubsub=True, services=True)
+    with pytest.raises(RuntimeError, match="replay failed"):
+        await stream.async_connect()
+    assert stream._ws is None
+    assert stream._reader is None
+    assert stream._keepalive is None
+    assert stream.endpoint is None
+    assert stream.socket_expires_at is None
+    assert stream._account_config is not None
+    assert second.closed
+    await stream.async_close()
+
+
+@pytest.mark.asyncio
+async def test_socket_expiry_is_sampled_before_the_handshake() -> None:
+    from pysmarthq.auth import AbstractAuth
+
+    socket = FakeSocket([], block_until_closed=True)
+    session = _session(socket)
+    auth = _auth(session)
+    auth.token["expires_at"] = 9_000_000_000
+
+    async def slow_connect(url: str, **kwargs: object) -> FakeSocket:
+        session.requests.append({"method": "WS", "url": url, **kwargs})
+        auth.token["expires_at"] = 9_999_999_999
+        await asyncio.sleep(0)
+        return socket
+
+    session.ws_connect = slow_connect  # type: ignore[method-assign]
+    stream = EventStream(auth, idle_ping_seconds=None)
+    await stream.async_connect()
+    assert stream.socket_expires_at == 9_000_000_000
+    await stream.async_close()
+
+    class FixedAuth(AbstractAuth):
+        async def async_get_access_token(self) -> str:
+            return "access-1"
+
+    plain = FakeSocket([], block_until_closed=True)
+    plain_session = _session(plain)
+    fixed = FixedAuth(plain_session, host="https://twin.example")  # type: ignore[arg-type]
+    other = EventStream(fixed, idle_ping_seconds=None)
+    await other.async_connect()
+    assert other.socket_expires_at is None
+    await other.async_close()
+
+
+@pytest.mark.asyncio
+async def test_error_frame_redacts_the_access_token() -> None:
+    socket = FakeSocket([], block_until_closed=True)
+    stream = EventStream(_auth(_session(socket)), idle_ping_seconds=None)
+    await stream.async_connect()
+    socket.push(
+        _frame(
+            WSMsgType.ERROR,
+            RuntimeError("Cannot connect to host wss://example.com/socket?access_token=secret-token"),
+        )
+    )
+    with pytest.raises(SmartHQStreamClosed) as caught:
+        await stream.async_receive()
+    assert "secret-token" not in str(caught.value)
+    assert "REDACTED" in str(caught.value)
+    await stream.async_close()

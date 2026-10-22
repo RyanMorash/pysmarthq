@@ -18,6 +18,10 @@ REQUEST_TIMEOUT_SECONDS = 30
 # ``GET /v2/device`` allows at most 100 rows per page.
 DEVICE_LIST_PAGE_SIZE = 100
 
+# Stop ``async_get_all_devices`` after this many pages so a huge ``total``
+# cannot be followed forever. 100 pages is 10,000 devices.
+DEVICE_LIST_MAX_PAGES = 100
+
 # Query filters shared by ``GET /v2/device`` and ``POST /v2/commands``.
 DEVICE_QUERY_FILTERS = (
     "deviceId",

@@ -6,7 +6,7 @@ from typing import Any
 
 from .auth import AbstractAuth
 from ._http import api_path, async_api
-from .const import DEVICE_LIST_PAGE_SIZE, DEVICE_QUERY_FILTERS
+from .const import DEVICE_LIST_MAX_PAGES, DEVICE_LIST_PAGE_SIZE, DEVICE_QUERY_FILTERS
 from .models import (
     AccountCommandHistoryResponse,
     BatchCommandHistoryResponse,
@@ -45,9 +45,10 @@ class SmartHQApi:
         """Return every device from ``GET /v2/device``.
 
         Requests ``perpage`` of 100 and follows ``page`` until ``page * perpage``
-        reaches ``total`` or a short page comes back. ``async_get_devices``
-        still returns one page. Other query parameters, including device
-        filters, are sent on every page.
+        reaches ``total``, a short page comes back, or a page repeats device
+        ids already collected. ``async_get_devices`` still returns one page.
+        More than ``DEVICE_LIST_MAX_PAGES`` pages raises ``SmartHQError``.
+        Other query parameters, including device filters, are sent on every page.
         """
         filters = {
             key: value
@@ -56,11 +57,18 @@ class SmartHQApi:
         }
         page = 1
         devices: list[Device] = []
+        seen: set[str] = set()
         while True:
+            if page > DEVICE_LIST_MAX_PAGES:
+                raise SmartHQError(f"Device list exceeded {DEVICE_LIST_MAX_PAGES} pages")
             listed = await self.async_get_devices(
                 params={**filters, "page": page, "perpage": DEVICE_LIST_PAGE_SIZE}
             )
             batch = listed.devices
+            ids = [device.deviceId for device in batch if device.deviceId]
+            if ids and all(device_id in seen for device_id in ids):
+                return devices
+            seen.update(ids)
             devices.extend(batch)
             size = listed.perpage if isinstance(listed.perpage, int) and listed.perpage > 0 else DEVICE_LIST_PAGE_SIZE
             current = listed.page if isinstance(listed.page, int) and listed.page > 0 else page
