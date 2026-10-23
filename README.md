@@ -17,8 +17,13 @@ This is an unofficial client. GE Appliances does not publish it. GE, GE Applianc
 
 The package is alpha (`0.1.0`). Names exported from `pysmarthq` are the supported surface, and they can change before 1.0.
 
+## Documentation
+
+The guide and API reference are published on [Read the Docs](https://pysmarthq.readthedocs.io). [`.readthedocs.yaml`](https://github.com/RyanMorash/pysmarthq/blob/main/.readthedocs.yaml) configures the Sphinx build.
+
 ## Contents
 
+- [Documentation](#documentation)
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Authentication](#authentication)
@@ -312,6 +317,13 @@ Requests follow the specs where the narrative docs differ:
 ```bash
 pip install -e ".[dev]"
 pytest
+```
+
+Build the Sphinx documentation:
+
+```bash
+pip install -e ".[docs]"
+sphinx-build -W -b html docs docs/_build/html
 ```
 
 To try an editable checkout inside Home Assistant:

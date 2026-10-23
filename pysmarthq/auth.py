@@ -36,6 +36,12 @@ from .const import ACCESS_TOKEN_REFRESH_LEEWAY_SECONDS, DIGITAL_TWIN_HOST, IAM_H
 from .errors import SmartHQAuthError
 
 TokenUpdater = Callable[[dict[str, Any]], Awaitable[None] | None]
+"""Callable that stores a refreshed token.
+
+``SmartHQAuth`` passes a JSON-serializable dict. The callable may return
+``None`` or an awaitable. It runs inside the refresh lock and must not call
+back into the client.
+"""
 
 _AUTH_QUERY_KEYS = ("code", "state", "expires_in", "error", "error_description")
 _LOGOUT_QUERY_KEYS = ("logout", "state")

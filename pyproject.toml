@@ -27,10 +27,12 @@ dependencies = ["aiohttp>=3.9"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+docs = ["sphinx>=7.4", "sphinx-rtd-theme>=3"]
 
 [project.urls]
 Homepage = "https://github.com/ryanmorash/pysmarthq"
-Documentation = "https://docs.smarthq.com"
+Documentation = "https://pysmarthq.readthedocs.io"
+"SmartHQ API" = "https://docs.smarthq.com"
 Issues = "https://github.com/ryanmorash/pysmarthq/issues"
 Source = "https://github.com/ryanmorash/pysmarthq"
 
